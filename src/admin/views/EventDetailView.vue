@@ -330,11 +330,12 @@ async function applyStatus(status) {
       <!-- CATEGORIES -->
       <div v-else-if="activeTab === 'categories'" class="flex gap-4 h-full min-h-0 overflow-hidden">
         <!-- Plan coloré par catégorie -->
-        <div class="flex-1 min-w-0 min-h-0 overflow-hidden rounded-xl bg-gray-100 flex items-center justify-center">
-          <span v-if="!hasPublishedSnapshot" class="text-sm text-gray-400">
+        <div class="flex-1 min-w-0 min-h-0 overflow-hidden">
+          <div v-if="!hasPublishedSnapshot" class="flex items-center justify-center h-full text-sm text-gray-400">
             Le plan n'a pas encore été publié.
-          </span>
+          </div>
           <EventPlanView v-else
+            class="h-full"
             :categories="categories"
             v-bind="planObjects"
             :seat-status-map="{}"
