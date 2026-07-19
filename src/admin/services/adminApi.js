@@ -71,6 +71,15 @@ export const adminApi = {
   async updateVenue(id, payload) {
     return (await apiFetch(`/api/charts/${id}`, { method: 'PUT', body: JSON.stringify({ name: payload.name, slug: slugify(payload.name) }) })).json();
   },
+  async updateVenueStatus(id, status) {
+    return (await apiFetch(`/api/charts/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status }) })).json();
+  },
+  async markVenuePendingChanges(id) {
+    return (await apiFetch(`/api/charts/${id}/mark-pending`, { method: 'POST' })).json();
+  },
+  async publishVenue(id) {
+    return (await apiFetch(`/api/charts/${id}/publish`, { method: 'POST' })).json();
+  },
   async deleteVenue(id) { await apiFetch(`/api/charts/${id}`, { method: 'DELETE' }); return { success: true }; },
 
   // ---------- CATEGORIES ----------
@@ -174,7 +183,7 @@ export const adminApi = {
       const { zones, seatRows, freeZones, tableZones, tableSections, cats } = await fetchAll(chartId);
       const newFz = {
         id: `fz${Date.now()}`, venueId: chartId, icon: 'none', color: '#6b7280',
-        pattern: 'solid', width: 100, height: 50, labelFontSize: 10,
+        textColor: '#000000', pattern: 'solid', width: 100, height: 50, labelFontSize: 10,
         ...payload, _type: 'freeZone',
       };
       freeZones.push(newFz);
@@ -212,7 +221,7 @@ export const adminApi = {
       const newT = {
         id: `tz${Date.now()}`, venueId: chartId,
         section: '', label: 'Table', seatCount: 6,
-        tableSize: 30, seatSize: 15, categoryId: null,
+        tableSize: 30, seatSize: 13, seatLabelFontSize: 9, tableLabelFontSize: 8, categoryId: null,
         rowLabelFontSize: 10, disabledSeats: [],
         ...payload, _type: 'tableZone',
       };
@@ -240,6 +249,37 @@ export const adminApi = {
     });
   },
 
+  // ---------- EVENTS ----------
+  async listEvents() {
+    return (await apiFetch('/api/events')).json();
+  },
+  async getEvent(id) {
+    return (await apiFetch(`/api/events/${id}`)).json();
+  },
+  async createEvent(payload) {
+    return (await apiFetch('/api/events', { method: 'POST', body: JSON.stringify(payload) })).json();
+  },
+  async updateEvent(id, payload) {
+    return (await apiFetch(`/api/events/${id}`, { method: 'PUT', body: JSON.stringify(payload) })).json();
+  },
+  async deleteEvent(id) {
+    await apiFetch(`/api/events/${id}`, { method: 'DELETE' });
+    return { success: true };
+  },
+  async bulkUpdateEventSeats(eventId, seatKeys, status) {
+    return (await apiFetch(`/api/events/${eventId}/seats/bulk-status`, {
+      method: 'PATCH',
+      body: JSON.stringify({ seatKeys, status }),
+    })).json();
+  },
+
+  // ---------- API KEYS ----------
+  async listApiKeys() { return (await apiFetch('/api/api-keys')).json(); },
+  async createApiKey(name, scope) {
+    return (await apiFetch('/api/api-keys', { method: 'POST', body: JSON.stringify({ name, scope }) })).json();
+  },
+  async deleteApiKey(id) { return (await apiFetch(`/api/api-keys/${id}`, { method: 'DELETE' })).json(); },
+
   // ---------- TABLE SECTIONS ----------
   async listTableSections(chartId) {
     const { tableSections } = splitObjects((await (await apiFetch(`/api/charts/${chartId}`)).json()).objects);
@@ -250,8 +290,8 @@ export const adminApi = {
       const { zones, seatRows, freeZones, tableZones, tableSections, cats } = await fetchAll(chartId);
       const newTs = {
         id: `tse${Date.now()}`, venueId: chartId,
-        section: '', label: 'Section de tables', tableCount: 3, seatsPerTable: 6,
-        tableSize: 30, seatSize: 15, tableSpacing: 20, categoryId: null,
+        section: '', label: 'Section de tables', tableCount: 3, tableRows: 1, seatsPerTable: 6,
+        tableSize: 30, seatSize: 13, seatLabelFontSize: 9, tableLabelFontSize: 13, tableSpacing: 0, categoryId: null,
         rowLabelFontSize: 10, disabledSeats: [],
         ...payload, _type: 'tableSection',
       };

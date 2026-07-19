@@ -3,13 +3,16 @@ import { ref, reactive, watch, computed, onMounted, nextTick } from 'vue';
 import { adminApi } from '../services/adminApi';
 import { computeSeatLabel, computeAxisLabel, ROW_FORMATS, COL_FORMATS, DIRECTIONS } from '../../services/seatLabel';
 import { FREE_ZONE_ICONS, FREE_ZONE_PATTERNS, iconById, patternStyle } from '../../services/icons';
+import PreviewPlan from './PreviewPlan.vue';
 
 const props = defineProps({
   venueId: { type: String, required: true },
-  categories: { type: Array, required: true },
+  planStatus: { type: String, default: 'draft' },
+  planPendingChanges: { type: Boolean, default: false },
 });
 const emit = defineEmits(['changed']);
 
+const categories = ref([]);
 const zones = ref([]);
 const seatRows = ref([]);
 const freeZones = ref([]);
@@ -25,6 +28,10 @@ const bulkCategoryChoice = ref('');
 
 const canvasRef = ref(null);
 const canvasContainerRef = ref(null);
+const showProps = ref(false);
+const showInfoTooltip = ref(false);
+// Auto-ouvre le panneau propriétés sur mobile quand un élément est sélectionné
+watch(selected, (v) => { if (v && window.innerWidth < 1024) showProps.value = true; });
 
 // ---- Zoom + Pan (translate libre) ----
 const ZOOM_MIN = 0.1;
@@ -68,12 +75,22 @@ function onWheel(ev) {
   zoom.value = next;
 }
 
+const LOD_THRESHOLD = 0.5;
+const isLod = computed(() => zoom.value < LOD_THRESHOLD);
+
+function itemShowBadge(item) {
+  return isLod.value || !!item.badgeVisible;
+}
+
 const drag = reactive({ active: false, mode: null, kind: null, id: null, offsetX: 0, offsetY: 0, startW: 0, startH: 0, startX: 0, startY: 0 });
 const pan = reactive({ active: false, startX: 0, startY: 0, originX: 0, originY: 0 });
+
+let panWasDrag = false;
 
 function startPan(ev) {
   if (ev.button !== 0) return;
   ev.preventDefault();
+  panWasDrag = false;
   pan.active = true;
   pan.startX = ev.clientX; pan.startY = ev.clientY;
   pan.originX = panX.value; pan.originY = panY.value;
@@ -84,14 +101,27 @@ function startPan(ev) {
 }
 function onPan(ev) {
   if (!pan.active) return;
-  panX.value = pan.originX + (ev.clientX - pan.startX);
-  panY.value = pan.originY + (ev.clientY - pan.startY);
+  const dx = ev.clientX - pan.startX, dy = ev.clientY - pan.startY;
+  if (Math.abs(dx) > 4 || Math.abs(dy) > 4) panWasDrag = true;
+  panX.value = pan.originX + dx;
+  panY.value = pan.originY + dy;
 }
 function stopPan() {
   pan.active = false;
   window.removeEventListener('pointermove', onPan);
   window.removeEventListener('pointerup', stopPan);
   window.removeEventListener('pointercancel', stopPan);
+}
+
+function onScrollerClick(ev) {
+  if (zoom.value >= 0.5 || panWasDrag) return;
+  const rect = scrollerRef.value.getBoundingClientRect();
+  const cx = (ev.clientX - rect.left - panX.value) / zoom.value;
+  const cy = (ev.clientY - rect.top  - panY.value) / zoom.value;
+  const newZoom = 1.5;
+  panX.value = rect.width  / 2 - cx * newZoom;
+  panY.value = rect.height / 2 - cy * newZoom;
+  zoom.value = newZoom;
 }
 
 
@@ -104,12 +134,18 @@ const CANVAS_PAD = 400;
 function tableZoneSize(t) {
   return (t.tableSize || 30) + 2 * (t.seatSize || 15) + 16;
 }
+const TS_PAD = 4; // inner padding inside tableSection border
 function tableSectionUnitSize(ts) {
   return (ts.tableSize || 30) + 2 * (ts.seatSize || 15) + 16;
 }
 function tableSectionWidth(ts) {
   const unit = tableSectionUnitSize(ts);
-  return (ts.tableCount || 3) * unit + ((ts.tableCount || 3) - 1) * (ts.tableSpacing || 20);
+  return (ts.tableCount || 3) * unit + ((ts.tableCount || 3) - 1) * (ts.tableSpacing ?? 2) + 2 * TS_PAD;
+}
+function tableSectionHeight(ts) {
+  const rows = ts.tableRows || 1;
+  const unit = tableSectionUnitSize(ts);
+  return rows * unit + (rows - 1) * (ts.tableSpacing ?? 2) + 2 * TS_PAD;
 }
 
 const canvasHeight = computed(() => {
@@ -118,7 +154,7 @@ const canvasHeight = computed(() => {
   for (const r of seatRows.value)   max = Math.max(max, (r.top  || 0) + (r.rows || 1) * ((r.seatSize || 22) + 4) + 30 + CANVAS_PAD);
   for (const f of freeZones.value)  max = Math.max(max, (f.top  || 0) + (f.height || 50)  + CANVAS_PAD);
   for (const t of tableZones.value) max = Math.max(max, (t.top  || 0) + tableZoneSize(t)   + CANVAS_PAD);
-  for (const ts of tableSections.value) max = Math.max(max, (ts.top || 0) + tableSectionUnitSize(ts) + 24 + CANVAS_PAD);
+  for (const ts of tableSections.value) max = Math.max(max, (ts.top || 0) + tableSectionHeight(ts) + CANVAS_PAD);
   return max;
 });
 
@@ -137,43 +173,142 @@ function initZCounter() {
   zCounter.value = all.reduce((max, o) => Math.max(max, o.zIndex || 0), 0);
 }
 
+const loadError = ref('');
+
 async function load() {
   loading.value = true;
-  zones.value = await adminApi.listZones(props.venueId);
-  seatRows.value = await adminApi.listSeatRows(props.venueId);
-  freeZones.value = await adminApi.listFreeZones(props.venueId);
-  tableZones.value = await adminApi.listTableZones(props.venueId);
-  tableSections.value = await adminApi.listTableSections(props.venueId);
-  initZCounter();
-  loading.value = false;
+  loadError.value = '';
+  try {
+    const [cats, zs, srs, fzs, tzs, tss] = await Promise.all([
+      adminApi.listCategories(props.venueId),
+      adminApi.listZones(props.venueId),
+      adminApi.listSeatRows(props.venueId),
+      adminApi.listFreeZones(props.venueId),
+      adminApi.listTableZones(props.venueId),
+      adminApi.listTableSections(props.venueId),
+    ]);
+    categories.value = cats;
+    zones.value = zs;
+    seatRows.value = srs;
+    freeZones.value = fzs;
+    tableZones.value = tzs;
+    tableSections.value = tss;
+    initZCounter();
+    emit('changed');
+  } catch (e) {
+    loadError.value = e.message || 'Erreur de chargement';
+  } finally {
+    loading.value = false;
+  }
+}
+
+// ---- Gestion des catégories inline ----
+const showCatPanel = ref(false);
+const catBtnRef = ref(null);
+const catPanelStyle = ref({});
+
+function toggleCatPanel() {
+  if (!showCatPanel.value) {
+    const rect = catBtnRef.value?.getBoundingClientRect();
+    if (rect) {
+      catPanelStyle.value = { top: (rect.bottom + 6) + 'px', left: rect.left + 'px' };
+    }
+  }
+  showCatPanel.value = !showCatPanel.value;
+  catFormOpen.value = false;
+  catError.value = '';
+}
+
+const catForm = ref({ name: '', color: '#2554c7' });
+const catEditing = ref(null);
+const catSaving = ref(false);
+const catError = ref('');
+const catFormOpen = ref(false);
+
+function openCatCreate() {
+  catEditing.value = null;
+  catForm.value = { name: '', color: '#2554c7' };
+  catFormOpen.value = true;
+}
+function openCatEdit(c) {
+  catEditing.value = c;
+  catForm.value = { name: c.name, color: c.color };
+  catFormOpen.value = true;
+}
+async function saveCat() {
+  if (!catForm.value.name.trim()) return;
+  catSaving.value = true;
+  const payload = { name: catForm.value.name.trim().toUpperCase(), color: catForm.value.color };
+  if (catEditing.value) {
+    await adminApi.updateCategory(catEditing.value.id, payload, props.venueId, catEditing.value.key);
+  } else {
+    await adminApi.createCategory(props.venueId, payload);
+  }
+  catSaving.value = false;
+  catFormOpen.value = false;
+  categories.value = await adminApi.listCategories(props.venueId);
   emit('changed');
+}
+// ---- Toast ----
+const toast = ref(null); // { message, type: 'success'|'error'|'info', timeout }
+let toastTimer = null;
+function showToast(message, type = 'success', duration = 3000) {
+  clearTimeout(toastTimer);
+  toast.value = { message, type };
+  toastTimer = setTimeout(() => { toast.value = null; }, duration);
+}
+
+// ---- Suppressions de catégories en attente (effectives uniquement à la publication) ----
+const pendingCatDeletions = reactive(new Set()); // Set<categoryId>
+
+function removeCat(c) {
+  catError.value = '';
+  pendingCatDeletions.add(c.id);
+  isDirty.value = true;
+  showToast(`Catégorie « ${c.name} » marquée pour suppression — sera définitive à la prochaine publication.`, 'info', 4000);
+}
+
+function cancelCatDeletion(c) {
+  pendingCatDeletions.delete(c.id);
+}
+
+async function flushPendingCatDeletions() {
+  for (const id of pendingCatDeletions) {
+    const cat = categories.value.find(c => c.id === id);
+    if (cat) {
+      try { await adminApi.deleteCategory(id, props.venueId, cat.key); } catch (_) {}
+    }
+  }
+  pendingCatDeletions.clear();
+  categories.value = await adminApi.listCategories(props.venueId);
 }
 watch(() => props.venueId, load, { immediate: true });
 
 function catById(id) {
-  return props.categories.find((c) => c.id === id) || { color: '#999999', name: '—' };
+  return categories.value.find((c) => c.id === id) || { color: '#999999', name: '—' };
 }
 
 function seatGrid(row) {
   const seats = [];
   const naming = { rowFormat: row.rowFormat, rowDirection: row.rowDirection, colFormat: row.colFormat, colDirection: row.colDirection };
   const disabledSeats = row.disabledSeats || [];
+  const deletedSeats  = row.deletedSeats  || [];
   const overrides = row.categoryOverrides || {};
   const section = row.section || row.label || row.id;
   for (let r = 0; r < row.rows; r++) {
     for (let c = 0; c < row.cols; c++) {
       const posKey = `${r}-${c}`;
-      const isDisabled = disabledSeats.includes(posKey);
+      const isDeleted  = deletedSeats.includes(posKey);
+      const isDisabled = !isDeleted && disabledSeats.includes(posKey);
       const rowLabel = computeAxisLabel(r, row.rows, naming.rowFormat, naming.rowDirection);
       const colLabel = computeAxisLabel(c, row.cols, naming.colFormat, naming.colDirection);
-      // Clé unique et lisible : section-rangée-siège
       const key = `${section}-${rowLabel}-${colLabel}`;
       seats.push({
         key, r, c, posKey,
         rowLabel, colLabel,
         label: computeSeatLabel(r, c, row.rows, row.cols, naming),
         categoryId: overrides[posKey] || row.categoryId,
-        status: isDisabled ? 'disabled' : (seatStatusOverrides[`${row.id}-${posKey}`] || 'available'),
+        status: isDeleted ? 'deleted' : isDisabled ? 'disabled' : (seatStatusOverrides[`${row.id}-${posKey}`] || 'available'),
       });
     }
   }
@@ -194,14 +329,24 @@ function tableSeats(t) {
 function tableSectionSeats(ts) {
   const section = ts.section || ts.label || ts.id;
   const disabled = ts.disabledSeats || [];
+  const deleted  = ts.deletedSeats  || [];
+  const cols = ts.tableCount || 3;
+  const rows = ts.tableRows || 1;
+  const totalTables = cols * rows;
+  const seatsOverrides = ts.tableSeatsOverrides || {};
+  const rotOverrides   = ts.tableRotationOverrides || {};
   const seats = [];
-  for (let ti = 0; ti < (ts.tableCount || 3); ti++) {
-    for (let si = 0; si < (ts.seatsPerTable || 6); si++) {
-      const disabledKey = `${ti}-${si}`;
+  for (let ti = 0; ti < totalTables; ti++) {
+    const seatsCount = seatsOverrides[ti] !== undefined ? Number(seatsOverrides[ti]) : (ts.seatsPerTable || 6);
+    const rotRad = ((rotOverrides[ti] || 0) * Math.PI) / 180;
+    for (let si = 0; si < seatsCount; si++) {
+      const posKey = `${ti}-${si}`;
+      const isDeleted  = deleted.includes(posKey);
+      const isDisabled = !isDeleted && disabled.includes(posKey);
       seats.push({
-        tableIndex: ti, seatIndex: si,
+        tableIndex: ti, seatIndex: si, seatsCount, rotRad,
         key: `${section}-${ti + 1}-${si + 1}`,
-        status: disabled.includes(disabledKey) ? 'disabled' : (seatStatusOverrides[`tse:${ts.id}|${ti}-${si}`] || 'available'),
+        status: isDeleted ? 'deleted' : isDisabled ? 'disabled' : (seatStatusOverrides[`tse:${ts.id}|${ti}-${si}`] || 'available'),
         categoryId: ts.categoryId,
       });
     }
@@ -234,7 +379,8 @@ const allSeatKeys = computed(() => {
   for (const ts of tableSections.value) {
     const section = ts.section || ts.label || ts.id;
     const disabled = ts.disabledSeats || [];
-    for (let ti = 0; ti < (ts.tableCount || 3); ti++) {
+    const totalTables = (ts.tableCount || 3) * (ts.tableRows || 1);
+    for (let ti = 0; ti < totalTables; ti++) {
       for (let si = 0; si < (ts.seatsPerTable || 6); si++) {
         if (!disabled.includes(`${ti}-${si}`)) keys.push(`${section}-${ti + 1}-${si + 1}`);
       }
@@ -249,6 +395,8 @@ const duplicateKeys = computed(() => {
   return Object.keys(counts).filter(k => counts[k] > 1);
 });
 
+const anomaliesOpen = ref(true);
+const hoveredTableSection = ref(null);
 const anomalies = computed(() => {
   const issues = [];
 
@@ -265,10 +413,12 @@ const anomalies = computed(() => {
     issues.push({ type: 'section', label: `${missingSection.length} élément(s) sans section définie`, items: missingSection });
   }
 
+  // catégories valides = existantes ET non marquées pour suppression
+  const catIds = new Set(categories.value.filter(c => !pendingCatDeletions.has(c.id)).map(c => c.id));
   const missingCategory = [
-    ...seatRows.value.filter(x => !x.categoryId).map(x => ({ id: x.id, kind: 'seatRow', label: x.section || x.label || x.id })),
-    ...tableZones.value.filter(x => !x.categoryId).map(x => ({ id: x.id, kind: 'tableZone', label: x.section || x.label || x.id })),
-    ...tableSections.value.filter(x => !x.categoryId).map(x => ({ id: x.id, kind: 'tableSection', label: x.section || x.label || x.id })),
+    ...seatRows.value.filter(x => !x.categoryId || !catIds.has(x.categoryId)).map(x => ({ id: x.id, kind: 'seatRow', label: x.section || x.label || x.id })),
+    ...tableZones.value.filter(x => !x.categoryId || !catIds.has(x.categoryId)).map(x => ({ id: x.id, kind: 'tableZone', label: x.section || x.label || x.id })),
+    ...tableSections.value.filter(x => !x.categoryId || !catIds.has(x.categoryId)).map(x => ({ id: x.id, kind: 'tableSection', label: x.section || x.label || x.id })),
   ];
   if (missingCategory.length > 0) {
     issues.push({ type: 'category', label: `${missingCategory.length} élément(s) sans catégorie définie`, items: missingCategory });
@@ -340,6 +490,12 @@ const selectedTableSectionSeat = computed(() => {
   if (!ts) return null;
   return { ts, ...selected.value.seatInfo };
 });
+const selectedTableSectionTable = computed(() => {
+  if (selected.value?.kind !== 'tableSectionTable') return null;
+  const ts = tableSections.value.find((x) => x.id === selected.value.tsId);
+  if (!ts) return null;
+  return { ts, tableIndex: selected.value.tableIndex };
+});
 const selectedSeat = computed(() => {
   if (selected.value?.kind !== 'seat') return null;
   const row = seatRows.value.find((r) => r.id === selected.value.rowId);
@@ -358,6 +514,7 @@ function selectSeatRow(r) { selected.value = { kind: 'seatRow', id: r.id }; mult
 function selectFreeZone(f) { selected.value = { kind: 'freeZone', id: f.id }; multiSelected.clear(); }
 function selectTableZone(t) { selected.value = { kind: 'tableZone', id: t.id }; multiSelected.clear(); }
 function selectTableSection(ts) { selected.value = { kind: 'tableSection', id: ts.id }; multiSelected.clear(); }
+function selectTableSectionTable(ts, tableIndex) { selected.value = { kind: 'tableSectionTable', tsId: ts.id, tableIndex }; multiSelected.clear(); }
 function selectTableSectionSeat(ts, seat) {
   selected.value = { kind: 'tableSectionSeat', tsId: ts.id, seatInfo: seat };
   multiSelected.clear();
@@ -417,6 +574,7 @@ function bringToFront(item) {
 }
 
 function startDrag(ev, kind, item) {
+  if (ev.button !== 0) return;
   ev.preventDefault();
   ev.stopPropagation();
   bringToFront(item);
@@ -431,6 +589,7 @@ function startDrag(ev, kind, item) {
   drag.mode = 'move';
   drag.kind = kind;
   drag.id = item.id;
+  drag.moved = false;
   drag.offsetX = (ev.clientX - canvasRect.left) / z - item.left;
   drag.offsetY = (ev.clientY - canvasRect.top)  / z - item.top;
   window.addEventListener('pointermove', onPointerMove);
@@ -447,6 +606,7 @@ function startResize(ev, kind, item, side) {
   drag.side = side;
   drag.kind = kind;
   drag.id = item.id;
+  drag.moved = false;
   drag.startW = item.width;
   drag.startH = item.height;
   drag.startLeft = item.left;
@@ -470,7 +630,32 @@ function startResizeSeatRow(ev, row, side) {
   drag.id = row.id;
   drag.baseRows = row.rows;
   drag.baseCols = row.cols;
+  drag.moved = false;
   drag.cellSize = (row.seatSize || 18) + 6;
+  drag.startX = ev.clientX;
+  drag.startY = ev.clientY;
+  window.addEventListener('pointermove', onPointerMove);
+  window.addEventListener('pointerup', stopDrag);
+}
+
+function startResizeTableSection(ev, ts, side) {
+  if (ev.button !== 0) return;
+  ev.preventDefault();
+  ev.stopPropagation();
+  selectTableSection(ts);
+  drag.active = true;
+  drag.mode = 'resizeTableSection';
+  drag.side = side;
+  drag.kind = 'tableSection';
+  drag.id = ts.id;
+  drag.baseTables = ts.tableCount || 3;
+  drag.baseTableRows = ts.tableRows || 1;
+  drag.startLeft = ts.left;
+  drag.startTop = ts.top;
+  drag.startW = tableSectionWidth(ts);
+  drag.startH = tableSectionHeight(ts);
+  drag.moved = false;
+  drag.hCellSize = tableSectionUnitSize(ts) + (ts.tableSpacing ?? 2);
   drag.startX = ev.clientX;
   drag.startY = ev.clientY;
   window.addEventListener('pointermove', onPointerMove);
@@ -487,6 +672,7 @@ function listFor(kind) {
 
 function onPointerMove(ev) {
   if (!drag.active) return;
+  drag.moved = true;
   const z = zoom.value;
   if (drag.mode === 'move') {
     const canvasRect = canvasRef.value.getBoundingClientRect();
@@ -494,6 +680,18 @@ function onPointerMove(ev) {
     let newTop  = Math.max(0, Math.round((ev.clientY - canvasRect.top)  / z - drag.offsetY));
     const item = listFor(drag.kind).find((x) => x.id === drag.id);
     if (item) { item.left = newLeft; item.top = newTop; }
+    // Détection de survol d'une tableSection lors du drag d'une tableZone
+    if (drag.kind === 'tableZone' && item) {
+      const tzSize = tableZoneSize(item);
+      const tzCX = item.left + tzSize / 2;
+      const tzCY = item.top  + tzSize / 2;
+      hoveredTableSection.value = tableSections.value.find((ts) =>
+        tzCX >= ts.left && tzCX <= ts.left + tableSectionWidth(ts) &&
+        tzCY >= ts.top  && tzCY <= ts.top  + tableSectionHeight(ts)
+      ) ?? null;
+    } else {
+      hoveredTableSection.value = null;
+    }
   } else if (drag.mode === 'resize') {
     const item = listFor(drag.kind).find((x) => x.id === drag.id);
     if (item) {
@@ -528,6 +726,25 @@ function onPointerMove(ev) {
         item.rows = Math.max(1, drag.baseRows - Math.round(dy / drag.cellSize));
       }
     }
+  } else if (drag.mode === 'resizeTableSection') {
+    const item = tableSections.value.find((x) => x.id === drag.id);
+    if (item) {
+      const dx = (ev.clientX - drag.startX) / z;
+      const dy = (ev.clientY - drag.startY) / z;
+      if (drag.side === 'right') {
+        item.tableCount = Math.max(1, drag.baseTables + Math.round(dx / drag.hCellSize));
+      } else if (drag.side === 'left') {
+        const newCount = Math.max(1, drag.baseTables - Math.round(dx / drag.hCellSize));
+        item.left = Math.max(0, Math.round(drag.startLeft + drag.startW - tableSectionWidth(item)));
+        item.tableCount = newCount;
+      } else if (drag.side === 'bottom') {
+        item.tableRows = Math.max(1, drag.baseTableRows + Math.round(dy / drag.hCellSize));
+      } else if (drag.side === 'top') {
+        const newRows = Math.max(1, drag.baseTableRows - Math.round(dy / drag.hCellSize));
+        item.top = Math.max(0, Math.round(drag.startTop + drag.startH - tableSectionHeight({ ...item, tableRows: newRows })));
+        item.tableRows = newRows;
+      }
+    }
   }
 }
 
@@ -539,7 +756,42 @@ async function stopDrag() {
   window.removeEventListener('pointerup', stopDrag);
 
   const item = listFor(kind).find((x) => x.id === id);
-  if (!item) return;
+  if (!item || !drag.moved) { hoveredTableSection.value = null; return; }
+  isDirty.value = true;
+
+  // Fusion d'une tableZone dans une tableSection survolée
+  if (mode === 'move' && kind === 'tableZone' && hoveredTableSection.value) {
+    const ts = hoveredTableSection.value;
+    hoveredTableSection.value = null;
+    const unit = tableSectionUnitSize(ts);
+    const newIndex = (ts.tableCount || 3); // index 0-based de la nouvelle table
+    const dropXInSection = item.left - ts.left;
+    const rawSpacing = newIndex > 0
+      ? (dropXInSection - TS_PAD - newIndex * unit) / newIndex
+      : (ts.tableSpacing ?? 2);
+    ts.tableSpacing = Math.max(0, Math.round(rawSpacing));
+    // Hérite catégorie et section de la tableZone si la section n'en a pas
+    if (!ts.categoryId && item.categoryId) ts.categoryId = item.categoryId;
+    if (!ts.section && item.section) ts.section = item.section;
+    // Copie du nombre de sièges si différent du défaut de la section
+    if (item.seatCount && item.seatCount !== (ts.seatsPerTable || 6)) {
+      if (!ts.tableSeatsOverrides) ts.tableSeatsOverrides = {};
+      ts.tableSeatsOverrides[newIndex] = item.seatCount;
+    }
+    ts.tableCount = newIndex + 1;
+    tableZones.value = tableZones.value.filter((x) => x.id !== item.id);
+    await adminApi.deleteTableZone(item.id, props.venueId);
+    await adminApi.updateTableSection(ts.id, {
+      tableCount: ts.tableCount,
+      tableSpacing: ts.tableSpacing,
+      tableSeatsOverrides: ts.tableSeatsOverrides || {},
+      categoryId: ts.categoryId,
+      section: ts.section,
+    }, props.venueId);
+    emit('changed');
+    return;
+  }
+  hoveredTableSection.value = null;
 
   if (mode === 'move') {
     if (kind === 'zone') await adminApi.updateZone(item.id, { top: item.top, left: item.left }, props.venueId);
@@ -550,6 +802,8 @@ async function stopDrag() {
   } else if (mode === 'resize') {
     if (kind === 'zone') await adminApi.updateZone(item.id, { width: item.width, height: item.height, top: item.top, left: item.left }, props.venueId);
     else await adminApi.updateFreeZone(item.id, { width: item.width, height: item.height, top: item.top, left: item.left }, props.venueId);
+  } else if (mode === 'resizeTableSection') {
+    await adminApi.updateTableSection(item.id, { tableCount: item.tableCount, tableRows: item.tableRows || 1, top: item.top, left: item.left }, props.venueId);
   } else if (mode === 'resizeSeatRow') {
     await adminApi.updateSeatRow(item.id, { rows: item.rows, cols: item.cols }, props.venueId);
   }
@@ -558,24 +812,26 @@ async function stopDrag() {
 
 // ---------- Ajout ----------
 async function addZone() {
-  if (props.categories.length === 0) return;
+  if (categories.value.length === 0) return;
   const z = await adminApi.createZone(props.venueId, {
-    label: 'Nouvelle zone', categoryId: props.categories[0].id,
+    label: 'Nouvelle zone', categoryId: categories.value[0].id,
     top: 40, left: 40, width: 200, height: 70, capacity: 50, shape: 'rect', labelFontSize: 11,
   });
   zones.value.push(z);
   selectZone(z);
+  isDirty.value = true;
   emit('changed');
 }
 async function addSeatRow() {
-  if (props.categories.length === 0) return;
+  if (categories.value.length === 0) return;
   const nextNumber = seatRows.value.reduce((max, r) => Math.max(max, r.blockNumber || 0), 0) + 1;
   const r = await adminApi.createSeatRow(props.venueId, {
-    section: '', label: 'Nouveau bloc', categoryId: props.categories[0].id,
+    section: '', label: 'Nouveau bloc', categoryId: categories.value[0].id,
     top: 40, left: 40, rows: 3, cols: 6, shape: 'rounded', seatSize: 22,
   });
   seatRows.value.push(r);
   selectSeatRow(r);
+  isDirty.value = true;
   emit('changed');
 }
 async function addFreeZone() {
@@ -585,36 +841,40 @@ async function addFreeZone() {
   });
   freeZones.value.push(fz);
   selectFreeZone(fz);
+  isDirty.value = true;
   emit('changed');
 }
 async function addTableSection() {
-  if (props.categories.length === 0) return;
+  if (categories.value.length === 0) return;
   const ts = await adminApi.createTableSection(props.venueId, {
     section: '', label: 'Section de tables', tableCount: 3, seatsPerTable: 6,
-    tableSize: 30, seatSize: 15, tableSpacing: 20,
-    categoryId: props.categories[0].id,
+    tableRows: 1, tableSize: 30, seatSize: 13, seatLabelFontSize: 9, tableSpacing: 20,
+    categoryId: categories.value[0].id,
     top: 80, left: 80, rowLabelFontSize: 10, disabledSeats: [],
   });
   tableSections.value.push(ts);
   selectTableSection(ts);
+  isDirty.value = true;
   emit('changed');
 }
 async function addTableZone() {
-  if (props.categories.length === 0) return;
+  if (categories.value.length === 0) return;
   const t = await adminApi.createTableZone(props.venueId, {
     section: '', label: 'Table', seatCount: 6,
-    tableSize: 30, seatSize: 15,
-    categoryId: props.categories[0].id,
+    tableSize: 30, seatSize: 13, seatLabelFontSize: 9,
+    categoryId: categories.value[0].id,
     top: 80, left: 200, rowLabelFontSize: 10, disabledSeats: [],
   });
   tableZones.value.push(t);
   selectTableZone(t);
+  isDirty.value = true;
   emit('changed');
 }
 
 // ---------- Édition via panneau latéral ----------
 let saveTimer = null;
 function scheduleSave() {
+  isDirty.value = true;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(persistSelected, 350);
 }
@@ -635,11 +895,14 @@ async function persistSelected() {
       rowFormat: r.rowFormat, rowDirection: r.rowDirection,
       colFormat: r.colFormat, colDirection: r.colDirection,
       rowLabelFontSize: Number(r.rowLabelFontSize),
+      badgeVisible: !!r.badgeVisible,
+      deletedSeats: r.deletedSeats || [],
     }, props.venueId);
   } else if (selectedFreeZone.value) {
     const f = selectedFreeZone.value;
     await adminApi.updateFreeZone(f.id, {
       label: f.label, icon: f.icon, color: f.color, pattern: f.pattern,
+      textColor: f.textColor || null, iconSize: f.iconSize ? Number(f.iconSize) : null,
       width: Number(f.width), height: Number(f.height), labelFontSize: Number(f.labelFontSize),
     }, props.venueId);
   } else if (selectedTableZone.value) {
@@ -647,50 +910,68 @@ async function persistSelected() {
     await adminApi.updateTableZone(t.id, {
       section: t.section, label: t.label, categoryId: t.categoryId,
       seatCount: Number(t.seatCount), tableSize: Number(t.tableSize),
-      seatSize: Number(t.seatSize), rowLabelFontSize: Number(t.rowLabelFontSize),
+      seatSize: Number(t.seatSize), seatLabelFontSize: Number(t.seatLabelFontSize || 9),
+      tableLabelFontSize: Number(t.tableLabelFontSize || 13),
+      rowLabelFontSize: Number(t.rowLabelFontSize), rotation: Number(t.rotation || 0),
       disabledSeats: t.disabledSeats || [],
     }, props.venueId);
   } else if (selectedTableSection.value) {
     const ts = selectedTableSection.value;
     await adminApi.updateTableSection(ts.id, {
       section: ts.section, label: ts.label, categoryId: ts.categoryId,
-      tableCount: Number(ts.tableCount), seatsPerTable: Number(ts.seatsPerTable),
+      tableCount: Number(ts.tableCount), tableRows: Number(ts.tableRows || 1), seatsPerTable: Number(ts.seatsPerTable),
       tableSize: Number(ts.tableSize), seatSize: Number(ts.seatSize),
+      seatLabelFontSize: Number(ts.seatLabelFontSize || 9),
+      tableLabelFontSize: Number(ts.tableLabelFontSize || 13),
       tableSpacing: Number(ts.tableSpacing), rowLabelFontSize: Number(ts.rowLabelFontSize),
+      rotation: Number(ts.rotation || 0),
+      badgeVisible: !!ts.badgeVisible,
       disabledSeats: ts.disabledSeats || [],
+      deletedSeats: ts.deletedSeats || [],
+      tableSeatsOverrides: ts.tableSeatsOverrides || {},
+      tableRotationOverrides: ts.tableRotationOverrides || {},
+      deletedTables: ts.deletedTables || [],
     }, props.venueId);
   }
   emit('changed');
 }
 
+function resetFreeZone() {
+  const f = selectedFreeZone.value;
+  if (!f) return;
+  f.color = '#6b7280';
+  f.textColor = '#000000';
+  f.icon = 'none';
+  f.iconSize = null;
+  f.pattern = 'solid';
+  f.labelFontSize = 10;
+  scheduleSave();
+}
+
 async function removeSelected() {
   if (selectedZone.value) {
     const z = selectedZone.value;
-    if (!confirm(`Supprimer "${z.label}" ?`)) return;
     await adminApi.deleteZone(z.id, props.venueId);
     zones.value = zones.value.filter((x) => x.id !== z.id);
   } else if (selectedSeatRow.value) {
     const r = selectedSeatRow.value;
-    if (!confirm(`Supprimer "${r.label}" ?`)) return;
     await adminApi.deleteSeatRow(r.id, props.venueId);
     seatRows.value = seatRows.value.filter((x) => x.id !== r.id);
   } else if (selectedFreeZone.value) {
     const f = selectedFreeZone.value;
-    if (!confirm(`Supprimer "${f.label}" ?`)) return;
     await adminApi.deleteFreeZone(f.id, props.venueId);
     freeZones.value = freeZones.value.filter((x) => x.id !== f.id);
   } else if (selectedTableZone.value) {
     const t = selectedTableZone.value;
-    if (!confirm(`Supprimer la table "${t.section || t.label}" ?`)) return;
     await adminApi.deleteTableZone(t.id, props.venueId);
     tableZones.value = tableZones.value.filter((x) => x.id !== t.id);
   } else if (selectedTableSection.value) {
     const ts = selectedTableSection.value;
-    if (!confirm(`Supprimer la section "${ts.section || ts.label}" ?`)) return;
     await adminApi.deleteTableSection(ts.id, props.venueId);
     tableSections.value = tableSections.value.filter((x) => x.id !== ts.id);
   }
   deselect();
+  isDirty.value = true;
   emit('changed');
 }
 
@@ -701,6 +982,7 @@ function toggleSelectedSeatStatus() {
   const current = seatStatusOverrides[s.seatId] || 'available';
   seatStatusOverrides[s.seatId] = current === 'sold' ? 'available' : 'sold';
   s.seatInfo.status = seatStatusOverrides[s.seatId];
+  isDirty.value = true;
 }
 
 // ---------- Activer/désactiver un siège (persisté) ----------
@@ -715,6 +997,7 @@ async function toggleSelectedSeatDisabled() {
   row.disabledSeats = list;
   s.seatInfo.status = idx >= 0 ? (seatStatusOverrides[s.seatId] || 'available') : 'disabled';
   await adminApi.updateSeatRow(row.id, { disabledSeats: list }, props.venueId);
+  isDirty.value = true;
   emit('changed');
 }
 
@@ -728,6 +1011,7 @@ async function toggleSelectedTableSeatDisabled() {
   t.disabledSeats = [...list];
   s.status = list.has(s.index) ? 'disabled' : 'available';
   await adminApi.updateTableZone(t.id, { disabledSeats: t.disabledSeats }, props.venueId);
+  isDirty.value = true;
   emit('changed');
 }
 
@@ -742,7 +1026,114 @@ async function toggleSelectedTableSectionSeatDisabled() {
   ts.disabledSeats = [...list];
   s.status = list.has(posKey) ? 'disabled' : 'available';
   await adminApi.updateTableSection(ts.id, { disabledSeats: ts.disabledSeats }, props.venueId);
+  isDirty.value = true;
   emit('changed');
+}
+
+async function deleteSeat() {
+  const s = selected.value;
+  if (!s || s.kind !== 'seat') return;
+  const row = seatRows.value.find((r) => r.id === s.rowId);
+  if (!row) return;
+  const list = [...(row.deletedSeats || [])];
+  if (!list.includes(s.seatInfo.posKey)) list.push(s.seatInfo.posKey);
+  row.deletedSeats = list;
+  s.seatInfo.status = 'deleted';
+  await adminApi.updateSeatRow(row.id, { deletedSeats: list }, props.venueId);
+  isDirty.value = true;
+  emit('changed');
+  deselect();
+}
+
+async function deleteTableSectionSeat() {
+  const s = selectedTableSectionSeat.value;
+  if (!s) return;
+  const ts = tableSections.value.find((x) => x.id === s.ts.id);
+  if (!ts) return;
+  const posKey = `${s.tableIndex}-${s.seatIndex}`;
+  const list = new Set(ts.deletedSeats || []);
+  list.add(posKey);
+  ts.deletedSeats = [...list];
+  await adminApi.updateTableSection(ts.id, { deletedSeats: ts.deletedSeats }, props.venueId);
+  isDirty.value = true;
+  emit('changed');
+  deselect();
+}
+
+async function disableTableSectionTable() {
+  const s = selectedTableSectionSeat.value;
+  if (!s) return;
+  const ts = tableSections.value.find((x) => x.id === s.ts.id);
+  if (!ts) return;
+  const count = (ts.tableSeatsOverrides?.[s.tableIndex] !== undefined) ? Number(ts.tableSeatsOverrides[s.tableIndex]) : (ts.seatsPerTable || 6);
+  const list = new Set(ts.disabledSeats || []);
+  for (let si = 0; si < count; si++) list.add(`${s.tableIndex}-${si}`);
+  ts.disabledSeats = [...list];
+  await adminApi.updateTableSection(ts.id, { disabledSeats: ts.disabledSeats }, props.venueId);
+  isDirty.value = true;
+  emit('changed');
+  deselect();
+}
+
+// Actions sur une table entière sélectionnée via son cercle
+async function toggleTableDisabled() {
+  const sel = selectedTableSectionTable.value;
+  if (!sel) return;
+  const { ts, tableIndex } = sel;
+  const count = (ts.tableSeatsOverrides?.[tableIndex] !== undefined) ? Number(ts.tableSeatsOverrides[tableIndex]) : (ts.seatsPerTable || 6);
+  const deleted = new Set(ts.deletedSeats || []);
+  const disabled = new Set(ts.disabledSeats || []);
+  // Vérifie si tous les sièges actifs (non supprimés) sont déjà désactivés
+  const activeKeys = [];
+  for (let si = 0; si < count; si++) {
+    const key = `${tableIndex}-${si}`;
+    if (!deleted.has(key)) activeKeys.push(key);
+  }
+  const allDisabled = activeKeys.every((k) => disabled.has(k));
+  if (allDisabled) {
+    activeKeys.forEach((k) => disabled.delete(k));
+  } else {
+    activeKeys.forEach((k) => disabled.add(k));
+  }
+  ts.disabledSeats = [...disabled];
+  await adminApi.updateTableSection(ts.id, { disabledSeats: ts.disabledSeats }, props.venueId);
+  isDirty.value = true;
+  emit('changed');
+}
+
+async function deleteEntireTable() {
+  const sel = selectedTableSectionTable.value;
+  if (!sel) return;
+  const { ts, tableIndex } = sel;
+  const count = (ts.tableSeatsOverrides?.[tableIndex] !== undefined) ? Number(ts.tableSeatsOverrides[tableIndex]) : (ts.seatsPerTable || 6);
+  const seats = new Set(ts.deletedSeats || []);
+  for (let si = 0; si < count; si++) seats.add(`${tableIndex}-${si}`);
+  ts.deletedSeats = [...seats];
+  const tables = new Set(ts.deletedTables || []);
+  tables.add(tableIndex);
+  ts.deletedTables = [...tables];
+  await adminApi.updateTableSection(ts.id, { deletedSeats: ts.deletedSeats, deletedTables: ts.deletedTables }, props.venueId);
+  isDirty.value = true;
+  emit('changed');
+  deselect();
+}
+
+function updateTableSeatsCount(seatsCount) {
+  const sel = selectedTableSectionTable.value;
+  if (!sel) return;
+  const { ts, tableIndex } = sel;
+  if (!ts.tableSeatsOverrides) ts.tableSeatsOverrides = {};
+  ts.tableSeatsOverrides[tableIndex] = Number(seatsCount);
+  scheduleSave();
+}
+
+function updateTableRotation(deg) {
+  const sel = selectedTableSectionTable.value;
+  if (!sel) return;
+  const { ts, tableIndex } = sel;
+  if (!ts.tableRotationOverrides) ts.tableRotationOverrides = {};
+  ts.tableRotationOverrides[tableIndex] = Number(deg);
+  scheduleSave();
 }
 
 // ---------- Actions groupées (multi-sélection de sièges) ----------
@@ -831,6 +1222,24 @@ function clearMultiSelection() {
 const saving = ref(false);
 const saveError = ref('');
 const saveSuccess = ref(false);
+const _isDirtyFlag = ref(props.planPendingChanges);
+const isDirty = computed({
+  get: () => _isDirtyFlag.value || pendingCatDeletions.size > 0,
+  set: (v) => { _isDirtyFlag.value = v; },
+});
+
+watch(() => props.planPendingChanges, (v) => {
+  if (v) _isDirtyFlag.value = true;
+});
+
+watch(isDirty, async (dirty) => {
+  if (dirty) {
+    try { await adminApi.markVenuePendingChanges(props.venueId); } catch (_) {}
+  }
+}, { immediate: false });
+
+const showPreview = ref(false);
+
 
 async function saveAll() {
   if (!canSave.value) return;
@@ -838,8 +1247,16 @@ async function saveAll() {
   saveSuccess.value = false;
   saving.value = true;
   try {
-    await adminApi.saveAllObjects(props.venueId, zones.value, seatRows.value, freeZones.value, props.categories, tableZones.value, tableSections.value);
+    const activeCats = categories.value.filter(c => !pendingCatDeletions.has(c.id));
+    await adminApi.saveAllObjects(props.venueId, zones.value, seatRows.value, freeZones.value, activeCats, tableZones.value, tableSections.value);
+    await Promise.all([
+      adminApi.publishVenue(props.venueId),
+      adminApi.updateVenueStatus(props.venueId, 'published'),
+    ]);
+    // Suppressions définitives uniquement après publication réussie
+    await flushPendingCatDeletions();
     saveSuccess.value = true;
+    isDirty.value = false;
     emit('changed');
     setTimeout(() => { saveSuccess.value = false; }, 2500);
   } catch (e) {
@@ -851,53 +1268,213 @@ async function saveAll() {
 </script>
 
 <template>
-  <div class="flex gap-4 h-full min-h-0 overflow-hidden">
+  <div class="flex gap-4 h-full min-h-0 overflow-hidden relative">
 
-    <div class="flex-1 min-w-0 bg-white rounded-2xl shadow-sm p-4 flex flex-col min-h-0">
-      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
-        <h3 class="font-bold text-gray-800">Éditeur du plan</h3>
-        <div class="flex gap-2">
-          <button :disabled="categories.length===0" @click="addZone"
-            class="text-xs font-semibold bg-gray-900 text-white px-3 py-1.5 rounded-lg hover:bg-gray-700 disabled:opacity-40">
-            + Zone
+    <div class="flex-1 min-w-0 bg-white rounded-2xl shadow-sm p-3 sm:p-4 flex flex-col min-h-0">
+      <!-- Toolbar -->
+      <div class="flex items-center gap-2 mb-2 overflow-x-auto pb-1 scrollbar-thin shrink-0">
+        <div class="flex items-center gap-1.5 shrink-0">
+          <span
+            class="text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0"
+            :class="{
+              'bg-yellow-100 text-yellow-700': props.planStatus === 'draft',
+              'bg-green-100 text-green-600':  props.planStatus === 'published',
+              'bg-gray-100 text-gray-500':    props.planStatus === 'archived',
+            }"
+          >{{ { draft: 'Brouillon', published: 'Publié', archived: 'Archivé' }[props.planStatus] }}</span>
+          <span v-if="isDirty" class="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-600 shrink-0 hidden sm:inline">
+            Modif. non sauvegardées
+          </span>
+        </div>
+        <!-- Catégories -->
+        <div class="shrink-0">
+          <button ref="catBtnRef" @click="toggleCatPanel"
+            class="flex items-center gap-1.5 px-2 py-1.5 rounded-lg text-xs font-semibold transition"
+            :class="showCatPanel ? 'bg-indigo-100 text-indigo-700 ring-1 ring-indigo-300' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'">
+            <span class="flex gap-0.5">
+              <span v-for="c in categories.slice(0, 5)" :key="c.id"
+                class="inline-block w-3 h-3 rounded-full border border-white/60"
+                :style="{ background: c.color }"></span>
+              <span v-if="categories.length === 0" class="text-gray-400 italic text-[10px]">Aucune</span>
+            </span>
+            <span class="hidden sm:inline">Catégories</span>
+            <svg class="w-3 h-3 text-gray-400 transition-transform" :class="showCatPanel ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
           </button>
-          <button :disabled="categories.length===0" @click="addSeatRow"
-            class="text-xs font-semibold bg-gray-900 text-white px-3 py-1.5 rounded-lg hover:bg-gray-700 disabled:opacity-40">
-            + Bloc de sièges
+        </div>
+
+        <!-- Panel catégories — Teleport sur body pour éviter le clipping overflow -->
+        <Teleport to="body">
+          <div v-if="showCatPanel"
+            class="fixed z-[9999] w-72 bg-white rounded-xl shadow-2xl border border-gray-200 overflow-hidden"
+            :style="catPanelStyle"
+            @click.stop>
+            <div class="px-3 py-2 bg-gray-50 border-b border-gray-100 flex items-center justify-between">
+              <span class="text-xs font-bold text-gray-700">Catégories</span>
+              <button @click="openCatCreate"
+                class="text-[10px] font-semibold bg-gray-900 text-white px-2 py-1 rounded-md hover:bg-gray-700">
+                + Ajouter
+              </button>
+            </div>
+            <p v-if="catError" class="text-[10px] text-red-500 px-3 pt-2">{{ catError }}</p>
+            <div v-if="categories.length === 0 && !catFormOpen" class="px-3 py-4 text-xs text-gray-400 text-center">
+              Aucune catégorie — créez-en une pour commencer.
+            </div>
+            <ul v-else-if="!catFormOpen" class="max-h-52 overflow-y-auto divide-y divide-gray-50">
+              <li v-for="c in categories" :key="c.id"
+                class="flex items-center gap-2 px-3 py-2"
+                :class="pendingCatDeletions.has(c.id) ? 'bg-red-50' : 'hover:bg-gray-50'">
+                <span class="w-4 h-4 rounded-full shrink-0 border border-gray-200 transition-opacity"
+                  :class="pendingCatDeletions.has(c.id) ? 'opacity-30' : ''"
+                  :style="{ background: c.color }"></span>
+                <span class="flex-1 text-xs font-semibold truncate"
+                  :class="pendingCatDeletions.has(c.id) ? 'text-red-400 line-through' : 'text-gray-800'">
+                  {{ c.name }}
+                </span>
+                <template v-if="pendingCatDeletions.has(c.id)">
+                  <span class="text-[10px] text-red-400 italic shrink-0">à supprimer</span>
+                  <button @click="cancelCatDeletion(c)" title="Annuler la suppression"
+                    class="w-6 h-6 flex items-center justify-center rounded hover:bg-red-100 text-red-400 hover:text-red-600 text-xs">↩</button>
+                </template>
+                <template v-else>
+                  <button @click="openCatEdit(c)" class="w-6 h-6 flex items-center justify-center rounded hover:bg-gray-100 text-gray-400 hover:text-gray-700 text-xs">✎</button>
+                  <button @click="removeCat(c)" class="w-6 h-6 flex items-center justify-center rounded hover:bg-red-50 text-gray-300 hover:text-red-500 text-xs">✕</button>
+                </template>
+              </li>
+            </ul>
+            <!-- Formulaire ajout/édition -->
+            <form v-if="catFormOpen" @submit.prevent="saveCat" class="px-3 py-3 flex flex-col gap-2">
+              <div class="flex items-center gap-2">
+                <input type="color" v-model="catForm.color" class="w-8 h-8 rounded cursor-pointer border border-gray-200 shrink-0" />
+                <input v-model="catForm.name" placeholder="Nom de la catégorie" autofocus
+                  class="flex-1 text-xs border border-gray-200 rounded-md px-2 py-1.5 focus:outline-none focus:ring-1 focus:ring-indigo-400" />
+              </div>
+              <div class="flex gap-2">
+                <button type="submit" :disabled="catSaving"
+                  class="flex-1 text-xs font-semibold bg-gray-900 text-white py-1.5 rounded-md hover:bg-gray-700 disabled:opacity-50">
+                  {{ catSaving ? '…' : (catEditing ? 'Enregistrer' : 'Créer') }}
+                </button>
+                <button type="button" @click="catFormOpen = false"
+                  class="flex-1 text-xs font-semibold bg-gray-100 text-gray-600 py-1.5 rounded-md hover:bg-gray-200">
+                  Annuler
+                </button>
+              </div>
+            </form>
+          </div>
+          <!-- Overlay invisible pour fermer au clic extérieur -->
+          <div v-if="showCatPanel" class="fixed inset-0 z-[9998]" @click="showCatPanel = false" />
+
+          <!-- Toast notifications -->
+          <Transition name="toast">
+            <div v-if="toast"
+              class="fixed bottom-6 left-1/2 -translate-x-1/2 z-[10001] px-4 py-2.5 rounded-xl shadow-xl text-sm font-semibold text-white pointer-events-none"
+              :class="toast.type === 'error' ? 'bg-red-500' : 'bg-gray-900'">
+              {{ toast.message }}
+            </div>
+          </Transition>
+        </Teleport>
+
+        <div class="flex gap-1.5 shrink-0">
+          <!-- + Bloc de sièges -->
+          <button :disabled="categories.length===0" @click="addSeatRow" title="+ Bloc de sièges"
+            class="text-xs font-semibold bg-gray-900 text-white rounded-lg hover:bg-gray-700 disabled:opacity-40 flex items-center gap-1.5 px-2 py-1.5 sm:px-2.5">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">Sièges</span>
           </button>
-          <button @click="addFreeZone" class="text-xs font-semibold bg-gray-100 text-gray-700 px-3 py-1.5 rounded-lg hover:bg-gray-200">
-            + Zone libre
+          <!-- + Zone libre -->
+          <button @click="addFreeZone" title="+ Zone libre"
+            class="text-xs font-semibold bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 flex items-center gap-1.5 px-2 py-1.5 sm:px-2.5">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="3" stroke="currentColor" stroke-width="2" fill="none"/>
+              <path stroke-linecap="round" stroke-linejoin="round" d="M12 8v8M8 12h8"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">Zone</span>
           </button>
-          <button :disabled="categories.length===0" @click="addTableZone"
-            class="text-xs font-semibold bg-gray-100 text-gray-700 px-3 py-1.5 rounded-lg hover:bg-gray-200 disabled:opacity-40">
-            + Table
+          <!-- + Table -->
+          <button :disabled="categories.length===0" @click="addTableZone" title="+ Table"
+            class="text-xs font-semibold bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-40 flex items-center gap-1.5 px-2 py-1.5 sm:px-2.5">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <circle cx="12" cy="12" r="4" stroke="currentColor" fill="none"/>
+              <circle cx="12" cy="4"  r="1.5" fill="currentColor"/>
+              <circle cx="12" cy="20" r="1.5" fill="currentColor"/>
+              <circle cx="4"  cy="12" r="1.5" fill="currentColor"/>
+              <circle cx="20" cy="12" r="1.5" fill="currentColor"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">Table</span>
           </button>
-          <button :disabled="categories.length===0" @click="addTableSection"
-            class="text-xs font-semibold bg-gray-100 text-gray-700 px-3 py-1.5 rounded-lg hover:bg-gray-200 disabled:opacity-40">
-            + Section de tables
+          <!-- + Section de tables -->
+          <button :disabled="categories.length===0" @click="addTableSection" title="+ Section de tables"
+            class="text-xs font-semibold bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 disabled:opacity-40 flex items-center gap-1.5 px-2 py-1.5 sm:px-2.5">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <rect x="2" y="7" width="8" height="5" rx="1.5" fill="none" stroke="currentColor"/>
+              <rect x="14" y="7" width="8" height="5" rx="1.5" fill="none" stroke="currentColor"/>
+              <rect x="2" y="15" width="8" height="5" rx="1.5" fill="none" stroke="currentColor"/>
+              <rect x="14" y="15" width="8" height="5" rx="1.5" fill="none" stroke="currentColor"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">Section</span>
           </button>
-          <button :disabled="saving || !canSave" @click="saveAll"
-            class="text-xs font-semibold bg-blue-600 text-white px-4 py-1.5 rounded-lg hover:bg-blue-700 disabled:opacity-50"
-            :title="!canSave ? 'Corrigez les anomalies avant de sauvegarder' : ''">
-            {{ saving ? 'Enregistrement…' : 'Sauvegarder' }}
+        </div>
+        <div class="flex gap-1.5 ml-auto shrink-0">
+          <!-- Publier -->
+          <button :disabled="saving || !canSave" @click="saveAll" title="Publier"
+            class="text-xs font-semibold bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-1.5 px-2 py-1.5 sm:px-3"
+            :title="!canSave ? 'Corrigez les anomalies avant de publier' : 'Publier'">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">{{ saving ? 'Publication…' : 'Publier' }}</span>
           </button>
-          <!-- Contrôles zoom -->
-          <div class="flex items-center gap-0.5 bg-gray-100 rounded-lg p-0.5 ml-1">
-            <button @click="zoomOut" class="w-7 h-7 flex items-center justify-center text-gray-600 hover:bg-white rounded-md text-base font-bold transition">−</button>
-            <button @click="zoomReset" class="px-1.5 h-7 flex items-center justify-center text-gray-500 hover:bg-white rounded-md text-[10px] font-semibold transition min-w-[40px]">{{ Math.round(zoom * 100) }}%</button>
-            <button @click="zoomIn"  class="w-7 h-7 flex items-center justify-center text-gray-600 hover:bg-white rounded-md text-base font-bold transition">+</button>
+          <!-- Aperçu -->
+          <button @click="showPreview = !showPreview" title="Aperçu"
+            class="text-xs font-semibold rounded-lg flex items-center gap-1.5 px-2 py-1.5 sm:px-2.5 transition"
+            :class="showPreview ? 'bg-indigo-600 text-white hover:bg-indigo-700' : 'bg-gray-100 text-gray-700 hover:bg-gray-200'">
+            <svg class="w-4 h-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+              <path stroke-linecap="round" stroke-linejoin="round" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+            </svg>
+            <span class="hidden sm:inline whitespace-nowrap">Aperçu</span>
+          </button>
+          <!-- Info tooltip (mobile) -->
+          <div class="relative">
+            <button @click="showInfoTooltip = !showInfoTooltip" title="Aide"
+              class="w-8 h-8 flex items-center justify-center rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-500">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"/>
+              </svg>
+            </button>
+            <div v-if="showInfoTooltip"
+              class="absolute right-0 top-10 z-30 w-72 bg-gray-900 text-gray-200 text-xs rounded-xl p-3 shadow-xl leading-relaxed"
+              @click.stop>
+              <button @click="showInfoTooltip = false" class="float-right text-gray-400 hover:text-white ml-2 leading-none">✕</button>
+              Glissez pour <strong class="text-white">déplacer</strong> · tirez un bord pour <strong class="text-white">redimensionner</strong> (bloc de sièges : gauche/droit = sièges par rang, haut/bas = rangées) · cliquez un siège pour le <strong class="text-white">sélectionner</strong>, <strong class="text-white">Ctrl/Cmd-clic</strong> ou <strong class="text-white">Maj-clic</strong> pour en sélectionner plusieurs.
+            </div>
+          </div>
+          <!-- Toggle propriétés (mobile) -->
+          <button @click="showProps = !showProps" title="Propriétés"
+            class="lg:hidden w-8 h-8 flex items-center justify-center rounded-lg hover:bg-gray-200 transition"
+            :class="showProps ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-600'">
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+              <path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><circle cx="12" cy="12" r="3"/>
+            </svg>
+          </button>
+          <!-- Zoom -->
+          <div class="flex items-center gap-0.5 bg-gray-100 rounded-lg p-0.5">
+            <button @click="zoomOut" class="w-6 h-6 flex items-center justify-center text-gray-600 hover:bg-white rounded-md font-bold transition">−</button>
+            <button @click="zoomReset" class="px-1 h-6 flex items-center justify-center text-gray-500 hover:bg-white rounded-md text-[10px] font-semibold transition min-w-[36px]">{{ Math.round(zoom * 100) }}%</button>
+            <button @click="zoomIn"  class="w-6 h-6 flex items-center justify-center text-gray-600 hover:bg-white rounded-md font-bold transition">+</button>
           </div>
         </div>
       </div>
       <p v-if="saveSuccess" class="text-xs text-green-600 bg-green-50 p-2 rounded-lg mb-2">Plan enregistré avec succès.</p>
-      <p v-if="categories.length===0" class="text-xs text-amber-600 mb-2">Créez d'abord au moins une catégorie.</p>
 
       <!-- Panneau d'anomalies -->
       <div v-if="anomalies.length > 0" class="mb-3 rounded-xl border border-red-200 bg-red-50 overflow-hidden">
-        <div class="flex items-center gap-2 px-3 py-2 bg-red-100 border-b border-red-200">
+        <button class="flex items-center justify-between w-full gap-2 px-3 py-2 bg-red-100 border-b border-red-200 hover:bg-red-200 transition-colors" @click="anomaliesOpen = !anomaliesOpen">
           <span class="text-red-600 font-bold text-xs">⚠ Anomalies détectées — sauvegarde bloquée</span>
-        </div>
-        <ul class="px-3 py-2 flex flex-col gap-2">
+          <svg class="w-3.5 h-3.5 text-red-500 shrink-0 transition-transform" :class="anomaliesOpen ? 'rotate-180' : ''" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M19 9l-7 7-7-7"/></svg>
+        </button>
+        <ul v-if="anomaliesOpen" class="px-3 py-2 flex flex-col gap-2 max-h-40 overflow-y-auto">
           <li v-for="a in anomalies" :key="a.type">
             <button
               class="text-xs text-red-700 font-semibold hover:text-red-900 hover:underline text-left w-full"
@@ -933,20 +1510,10 @@ async function saveAll() {
         </ul>
       </div>
       <p v-if="saveError" class="text-xs text-red-500 bg-red-50 p-2 rounded-lg mb-2">{{ saveError }}</p>
-      <p class="text-xs text-gray-400 mb-3">
-        Glissez pour déplacer · tirez un bord pour redimensionner (sur un bloc de sièges : gauche/droit = sièges par
-        rang, haut/bas = rangées) · cliquez un siège pour le sélectionner, <strong>Ctrl/Cmd-clic</strong> ou
-        <strong>Maj-clic</strong> pour en sélectionner plusieurs.
-      </p>
 
       <!-- Barre d'actions groupées -->
       <div v-if="multiSelected.size > 0" class="mb-3 p-3 rounded-lg bg-gray-900 text-white flex items-center flex-wrap gap-2 text-xs">
         <span class="font-semibold">{{ multiSelected.size }} siège(s) sélectionné(s)</span>
-        <button @click="bulkSetDisabled(true)" class="px-3 py-1.5 rounded-md bg-amber-500 hover:bg-amber-400 font-semibold">Désactiver la sélection</button>
-        <button @click="bulkSetDisabled(false)" class="px-3 py-1.5 rounded-md bg-gray-700 hover:bg-gray-600 font-semibold">Réactiver la sélection</button>
-        <span class="border-l border-gray-600 h-5 mx-1"></span>
-        <button @click="bulkSetStatus('sold')" class="px-3 py-1.5 rounded-md bg-gray-500 hover:bg-gray-400 font-semibold">Marquer vendus</button>
-        <button @click="bulkSetStatus('available')" class="px-3 py-1.5 rounded-md bg-green-600 hover:bg-green-500 font-semibold">Marquer disponibles</button>
         <span class="border-l border-gray-600 h-5 mx-1"></span>
         <select v-model="bulkCategoryChoice" class="px-2 py-1.5 rounded-md text-gray-800 text-xs">
           <option value="" disabled>Changer catégorie…</option>
@@ -957,13 +1524,25 @@ async function saveAll() {
       </div>
 
       <div v-if="loading" class="text-sm text-gray-400 py-10 text-center">Chargement…</div>
+      <div v-else-if="loadError" class="text-sm text-red-500 py-10 text-center">{{ loadError }}</div>
+
+      <PreviewPlan v-else-if="showPreview"
+        :categories="categories"
+        :zones="zones"
+        :seat-rows="seatRows"
+        :free-zones="freeZones"
+        :table-zones="tableZones"
+        :table-sections="tableSections"
+        class="flex-1 min-h-0 rounded-xl overflow-hidden"
+      />
 
       <div v-else ref="scrollerRef"
         class="overflow-hidden rounded-xl flex-1 min-h-0 bg-gray-400 relative"
         :class="pan.active ? 'cursor-grabbing' : 'cursor-grab'"
         style="touch-action: none;"
         @wheel.prevent="onWheel"
-        @pointerdown="startPan"
+        @pointerdown="startPan($event); showInfoTooltip = false; showCatPanel = false"
+        @click="onScrollerClick"
       >
         <div ref="canvasRef" class="absolute bg-white shadow-xl"
           :style="{
@@ -1003,14 +1582,14 @@ async function saveAll() {
             :class="selected && selected.kind==='freeZone' && selected.id===fz.id ? 'ring-2 ring-gray-900' : ''"
             :style="{
               top: fz.top + 'px', left: fz.left + 'px', width: fz.width + 'px', height: fz.height + 'px',
-              ...patternStyle(fz.pattern, fz.color),
+              background: fz.color,
               border: `1px solid ${fz.color}55`,
               zIndex: fz.zIndex || 1,
             }"
             @pointerdown="startDrag($event, 'freeZone', fz)"
           >
-            <span v-if="iconById(fz.icon).emoji" class="pointer-events-none" style="line-height:1" :style="{ fontSize: Math.max(12, fz.height * 0.3) + 'px' }">{{ iconById(fz.icon).emoji }}</span>
-            <span class="font-bold uppercase pointer-events-none" :style="{ color: fz.color, fontSize: (fz.labelFontSize || 10) + 'px' }">{{ fz.label }}</span>
+            <span v-if="iconById(fz.icon).emoji" class="pointer-events-none" style="line-height:1" :style="{ fontSize: (fz.iconSize || Math.max(12, fz.height * 0.3)) + 'px' }">{{ iconById(fz.icon).emoji }}</span>
+            <span class="font-bold uppercase pointer-events-none" :style="{ color: fz.textColor || '#000000', fontSize: (fz.labelFontSize || 10) + 'px' }">{{ fz.label }}</span>
             <div class="absolute left-2 right-2 -top-1 h-2 cursor-ns-resize" @pointerdown="startResize($event, 'freeZone', fz, 'top')"></div>
             <div class="absolute left-2 right-2 -bottom-1 h-2 cursor-ns-resize" @pointerdown="startResize($event, 'freeZone', fz, 'bottom')"></div>
             <div class="absolute top-2 bottom-2 -left-1 w-2 cursor-ew-resize" @pointerdown="startResize($event, 'freeZone', fz, 'left')"></div>
@@ -1025,6 +1604,7 @@ async function saveAll() {
               top: t.top + 'px', left: t.left + 'px',
               width: tableZoneSize(t) + 'px', height: tableZoneSize(t) + 'px',
               zIndex: t.zIndex || 1,
+              transform: `rotate(${t.rotation || 0}deg)`,
             }"
             @pointerdown="startDrag($event, 'tableZone', t)"
           >
@@ -1039,16 +1619,16 @@ async function saveAll() {
                 ]"
                 :style="{
                   width: (t.seatSize || 15) + 'px', height: (t.seatSize || 15) + 'px',
-                  fontSize: Math.max(6, Math.floor((t.seatSize || 15) * 0.42)) + 'px',
+                  fontSize: (t.seatLabelFontSize || 9) + 'px',
                   background: seat.status === 'disabled' ? '#eef0f2' : catById(t.categoryId).color,
                   border: seat.status === 'disabled' ? '1px solid #d8dade' : 'none',
                   color: seat.status === 'disabled' ? '#9ca3af' : '#fff',
-                  left: (tableZoneSize(t) / 2 + ((t.tableSize || 30) / 2 + (t.seatSize || 15) / 2 + 8) * Math.cos((2 * Math.PI * seat.index) / (t.seatCount || 6) - Math.PI / 2) - (t.seatSize || 15) / 2) + 'px',
-                  top:  (tableZoneSize(t) / 2 + ((t.tableSize || 30) / 2 + (t.seatSize || 15) / 2 + 8) * Math.sin((2 * Math.PI * seat.index) / (t.seatCount || 6) - Math.PI / 2) - (t.seatSize || 15) / 2) + 'px',
+                  left: (tableZoneSize(t) / 2 + ((t.tableSize || 30) / 2 + (t.seatSize || 15) / 2) * Math.cos((2 * Math.PI * seat.index) / (t.seatCount || 6) - Math.PI / 2) - (t.seatSize || 15) / 2) + 'px',
+                  top:  (tableZoneSize(t) / 2 + ((t.tableSize || 30) / 2 + (t.seatSize || 15) / 2) * Math.sin((2 * Math.PI * seat.index) / (t.seatCount || 6) - Math.PI / 2) - (t.seatSize || 15) / 2) + 'px',
                 }"
                 @pointerdown.stop
                 @click.stop="onTableSeatClick(t, seat, $event)"
-              >{{ (t.seatSize || 15) >= 14 ? seat.index + 1 : '' }}</div>
+              >{{ seat.index + 1 }}</div>
             </template>
             <!-- Table ronde au centre -->
             <div
@@ -1064,7 +1644,7 @@ async function saveAll() {
               }"
             >
               <span class="font-bold text-center leading-tight pointer-events-none"
-                :style="{ color: catById(t.categoryId).color, fontSize: (t.rowLabelFontSize || 10) + 'px' }">
+                :style="{ color: catById(t.categoryId).color, fontSize: (t.tableLabelFontSize || 13) + 'px' }">
                 {{ t.section || catById(t.categoryId).name }}
               </span>
             </div>
@@ -1077,60 +1657,92 @@ async function saveAll() {
             :style="{
               top: ts.top + 'px', left: ts.left + 'px',
               width: tableSectionWidth(ts) + 'px',
-              height: tableSectionUnitSize(ts) + 24 + 'px',
+              height: tableSectionHeight(ts) + 'px',
               zIndex: ts.zIndex || 1,
-              border: `2px dashed ${catById(ts.categoryId).color}70`,
-              borderRadius: '14px',
-              outline: selected && selected.kind==='tableSection' && selected.id===ts.id ? `2px solid ${catById(ts.categoryId).color}` : 'none',
-              outlineOffset: '3px',
+              background: catById(ts.categoryId).color + '14',
+              border: `1px solid ${catById(ts.categoryId).color}55`,
+              borderRadius: '10px',
+              outline: hoveredTableSection?.id === ts.id
+                ? `3px dashed ${catById(ts.categoryId).color}`
+                : selected && selected.kind==='tableSection' && selected.id===ts.id ? `2px solid ${catById(ts.categoryId).color}` : 'none',
+              outlineOffset: '2px',
+              transform: `rotate(${ts.rotation || 0}deg)`,
             }"
             @pointerdown="startDrag($event, 'tableSection', ts)"
           >
-            <!-- Badge section -->
-            <div class="editor-row-badge pointer-events-none"
-              :style="{ color: catById(ts.categoryId).color, borderColor: catById(ts.categoryId).color + '55', fontSize: (ts.rowLabelFontSize || 10) + 'px' }">
+            <!-- Badge LOD centré -->
+            <div v-if="itemShowBadge(ts)"
+              class="lod-section-badge"
+              :style="{
+                color: catById(ts.categoryId).color,
+                borderColor: catById(ts.categoryId).color + '55',
+                fontSize: (ts.rowLabelFontSize || 10) + 'px',
+              }">
               {{ ts.section || catById(ts.categoryId).name }}
             </div>
-            <!-- Une table par index -->
-            <template v-for="ti in (ts.tableCount || 3)" :key="ti">
-              <template v-for="seat in tableSectionSeats(ts).filter(s => s.tableIndex === ti - 1)" :key="seat.tableIndex + '-' + seat.seatIndex">
-                <div
-                  class="absolute flex items-center justify-center text-white font-bold rounded-full"
-                  style="pointer-events: auto; cursor: pointer;"
-                  :class="[
-                    selected && selected.kind==='tableSectionSeat' && selected.tsId===ts.id && selected.seatInfo?.tableIndex===seat.tableIndex && selected.seatInfo?.seatIndex===seat.seatIndex ? 'ring-2 ring-offset-1 ring-gray-900' : '',
-                    isMultiSelectedTableSectionSeat(ts, seat) ? 'ring-2 ring-offset-1 ring-blue-500' : '',
-                  ]"
-                  :style="{
-                    width: (ts.seatSize || 15) + 'px', height: (ts.seatSize || 15) + 'px',
-                    fontSize: Math.max(6, Math.floor((ts.seatSize || 15) * 0.42)) + 'px',
-                    background: seat.status === 'disabled' ? '#eef0f2' : catById(ts.categoryId).color,
-                    border: seat.status === 'disabled' ? '1px solid #d8dade' : 'none',
-                    color: seat.status === 'disabled' ? '#9ca3af' : '#fff',
-                    left: ((ti - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing || 20)) + tableSectionUnitSize(ts) / 2 + ((ts.tableSize || 30) / 2 + (ts.seatSize || 15) / 2 + 8) * Math.cos((2 * Math.PI * seat.seatIndex) / (ts.seatsPerTable || 6) - Math.PI / 2) - (ts.seatSize || 15) / 2) + 'px',
-                    top:  (24 + tableSectionUnitSize(ts) / 2 + ((ts.tableSize || 30) / 2 + (ts.seatSize || 15) / 2 + 8) * Math.sin((2 * Math.PI * seat.seatIndex) / (ts.seatsPerTable || 6) - Math.PI / 2) - (ts.seatSize || 15) / 2) + 'px',
-                  }"
-                  @pointerdown.stop
-                  @click.stop="onTableSectionSeatClick(ts, seat, $event)"
-                >{{ (ts.seatSize || 15) >= 14 ? seat.seatIndex + 1 : '' }}</div>
+
+            <!-- Grille de tables : tableRows rangées × tableCount colonnes -->
+            <div :class="itemShowBadge(ts) ? 'lod-blur' : ''">
+              <template v-for="ri in (ts.tableRows || 1)" :key="'r' + ri">
+                <template v-for="ci in (ts.tableCount || 3)" :key="'r' + ri + 'c' + ci">
+                  <!-- Index global de la table (0-based) -->
+                  <template v-if="!(ts.deletedTables || []).includes((ri - 1) * (ts.tableCount || 3) + (ci - 1))">
+                  <template v-for="seat in tableSectionSeats(ts).filter(s => s.tableIndex === (ri - 1) * (ts.tableCount || 3) + (ci - 1))" :key="seat.tableIndex + '-' + seat.seatIndex">
+
+                    <div
+                      v-if="seat.status !== 'deleted'"
+                      class="absolute flex items-center justify-center text-white font-bold rounded-full"
+                      style="pointer-events: auto; cursor: pointer;"
+                      :class="[
+                        selected && selected.kind==='tableSectionSeat' && selected.tsId===ts.id && selected.seatInfo?.tableIndex===seat.tableIndex && selected.seatInfo?.seatIndex===seat.seatIndex ? 'ring-2 ring-offset-1 ring-gray-900' : '',
+                        isMultiSelectedTableSectionSeat(ts, seat) ? 'ring-2 ring-offset-1 ring-blue-500' : '',
+                      ]"
+                      :style="{
+                        width: (ts.seatSize || 15) + 'px', height: (ts.seatSize || 15) + 'px',
+                        fontSize: (ts.seatLabelFontSize || 9) + 'px',
+                        background: seat.status === 'disabled' ? '#eef0f2' : catById(ts.categoryId).color,
+                        border: seat.status === 'disabled' ? '1px solid #d8dade' : 'none',
+                        color: seat.status === 'disabled' ? '#9ca3af' : '#fff',
+                        left: (TS_PAD + (ci - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing ?? 2)) + tableSectionUnitSize(ts) / 2 + ((ts.tableSize || 30) / 2 + (ts.seatSize || 15) / 2) * Math.cos((2 * Math.PI * seat.seatIndex) / seat.seatsCount - Math.PI / 2 + seat.rotRad) - (ts.seatSize || 15) / 2) + 'px',
+                        top:  (TS_PAD + (ri - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing ?? 2)) + tableSectionUnitSize(ts) / 2 + ((ts.tableSize || 30) / 2 + (ts.seatSize || 15) / 2) * Math.sin((2 * Math.PI * seat.seatIndex) / seat.seatsCount - Math.PI / 2 + seat.rotRad) - (ts.seatSize || 15) / 2) + 'px',
+                      }"
+                      @pointerdown.stop
+                      @click.stop="onTableSectionSeatClick(ts, seat, $event)"
+                    >{{ seat.seatIndex + 1 }}</div>
+                  </template>
+                  <!-- Table circle (cliquable pour sélectionner la table) -->
+                  <div
+                    class="absolute rounded-full flex items-center justify-center cursor-pointer"
+                    style="pointer-events: auto;"
+                    :style="{
+                      width: (ts.tableSize || 30) + 'px', height: (ts.tableSize || 30) + 'px',
+                      left: (TS_PAD + (ci - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing ?? 2)) + (tableSectionUnitSize(ts) - (ts.tableSize || 30)) / 2) + 'px',
+                      top:  (TS_PAD + (ri - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing ?? 2)) + (tableSectionUnitSize(ts) - (ts.tableSize || 30)) / 2) + 'px',
+                      background: catById(ts.categoryId).color + '22',
+                      border: selected && selected.kind === 'tableSectionTable' && selected.tsId === ts.id && selected.tableIndex === ((ri - 1) * (ts.tableCount || 3) + (ci - 1))
+                        ? `3px solid ${catById(ts.categoryId).color}`
+                        : `2px solid ${catById(ts.categoryId).color}88`,
+                      boxShadow: selected && selected.kind === 'tableSectionTable' && selected.tsId === ts.id && selected.tableIndex === ((ri - 1) * (ts.tableCount || 3) + (ci - 1))
+                        ? `0 0 0 2px #fff, 0 0 0 4px ${catById(ts.categoryId).color}`
+                        : 'none',
+                    }"
+                    @pointerdown.stop
+                    @click.stop="selectTableSectionTable(ts, (ri - 1) * (ts.tableCount || 3) + (ci - 1))"
+                  >
+                    <span class="font-bold text-center leading-tight pointer-events-none"
+                      :style="{ color: catById(ts.categoryId).color, fontSize: (ts.tableLabelFontSize || 13) + 'px' }">
+                      T{{ (ri - 1) * (ts.tableCount || 3) + ci }}
+                    </span>
+                  </div>
+                  </template><!-- /v-if deletedTables -->
+                </template>
               </template>
-              <!-- Table circle -->
-              <div
-                class="absolute rounded-full flex items-center justify-center pointer-events-none"
-                :style="{
-                  width: (ts.tableSize || 30) + 'px', height: (ts.tableSize || 30) + 'px',
-                  left: ((ti - 1) * (tableSectionUnitSize(ts) + (ts.tableSpacing || 20)) + (tableSectionUnitSize(ts) - (ts.tableSize || 30)) / 2) + 'px',
-                  top:  (24 + (tableSectionUnitSize(ts) - (ts.tableSize || 30)) / 2) + 'px',
-                  background: catById(ts.categoryId).color + '22',
-                  border: `2px solid ${catById(ts.categoryId).color}88`,
-                }"
-              >
-                <span class="font-bold text-center leading-tight pointer-events-none"
-                  :style="{ color: catById(ts.categoryId).color, fontSize: Math.max(6, (ts.rowLabelFontSize || 10) - 2) + 'px' }">
-                  T{{ ti }}
-                </span>
-              </div>
-            </template>
+            </div>
+            <!-- Handles de resize tableSection -->
+            <div class="absolute left-4 right-4 -bottom-1 h-2 cursor-ns-resize" style="pointer-events:auto" @pointerdown.stop="startResizeTableSection($event, ts, 'bottom')"></div>
+            <div class="absolute left-4 right-4 -top-1 h-2 cursor-ns-resize" style="pointer-events:auto" @pointerdown.stop="startResizeTableSection($event, ts, 'top')"></div>
+            <div class="absolute top-4 bottom-4 -left-1 w-2 cursor-ew-resize" style="pointer-events:auto" @pointerdown.stop="startResizeTableSection($event, ts, 'left')"></div>
+            <div class="absolute top-4 bottom-4 -right-1 w-2 cursor-ew-resize" style="pointer-events:auto" @pointerdown.stop="startResizeTableSection($event, ts, 'right')"></div>
           </div>
 
           <!-- Blocs de sièges nominatifs -->
@@ -1140,11 +1752,6 @@ async function saveAll() {
             :style="{ top: row.top + 'px', left: row.left + 'px', zIndex: row.zIndex || 1 }"
             @pointerdown="startDrag($event, 'seatRow', row)"
           >
-            <!-- Badge catégorie du bloc -->
-            <div class="editor-row-badge pointer-events-none"
-              :style="{ color: catById(row.categoryId).color, borderColor: catById(row.categoryId).color + '55', fontSize: (row.rowLabelFontSize || 10) + 'px' }">
-              {{ row.section || catById(row.categoryId).name }}
-            </div>
             <!-- Carte dont la couleur suit la catégorie -->
             <div class="editor-seat-card pointer-events-none" style="pointer-events:none"
               :style="{
@@ -1152,31 +1759,43 @@ async function saveAll() {
                 borderColor: catById(row.categoryId).color + '55',
                 outline: selected && selected.kind==='seatRow' && selected.id===row.id ? `2px solid ${catById(row.categoryId).color}` : 'none',
                 outlineOffset: '2px',
+                position: 'relative',
               }">
+              <!-- Badge LOD centré -->
+              <div v-if="itemShowBadge(row)"
+                class="lod-section-badge"
+                :style="{
+                  color: catById(row.categoryId).color,
+                  borderColor: catById(row.categoryId).color + '55',
+                  fontSize: (row.rowLabelFontSize || 10) + 'px',
+                }">
+                {{ row.section || catById(row.categoryId).name }}
+              </div>
               <div class="grid gap-1.5"
+                :class="itemShowBadge(row) ? 'lod-blur' : ''"
                 :style="{ gridTemplateColumns: `repeat(${row.cols}, minmax(${row.shape === 'rounded' ? (row.seatSize || 22) * 1.5 : (row.seatSize || 22)}px, auto))` }">
                 <div
                   v-for="seat in seatGrid(row)" :key="seat.key"
-                  class="flex items-center justify-center text-white font-semibold leading-none cursor-pointer"
-                  style="pointer-events:auto"
-                  :class="[
-                    selected && selected.kind==='seat' && selected.seatId===seat.key ? 'ring-2 ring-offset-1 ring-gray-900' : '',
-                    isMultiSelected(row, seat) ? 'ring-2 ring-offset-1 ring-blue-500' : '',
-                  ]"
+                  class="flex items-center justify-center text-white font-semibold leading-none"
+                  :class="seat.status === 'deleted' ? '' : 'cursor-pointer'"
                   :style="{
                     height: (row.seatSize || 22) + 'px',
                     minWidth: row.shape === 'rounded' ? ((row.seatSize || 22) * 1.5) + 'px' : (row.seatSize || 22) + 'px',
                     padding: row.shape === 'rounded' ? '0 6px' : '0',
                     fontSize: Math.max(6, Math.floor((row.seatSize || 22) * 0.42)) + 'px',
                     borderRadius: row.shape === 'round' ? '50%' : row.shape === 'rounded' ? '10px' : '4px',
+                    visibility: seat.status === 'deleted' ? 'hidden' : 'visible',
                     background: seat.status === 'sold' ? '#9ca3af' : seat.status === 'disabled' ? '#eef0f2' : catById(seat.categoryId).color,
                     color: seat.status === 'disabled' ? '#9ca3af' : '#fff',
                     opacity: seat.status === 'sold' ? 0.55 : 1,
                     border: seat.status === 'disabled' ? '1px solid #d8dade' : 'none',
+                    outline: selected && selected.kind==='seat' && selected.seatId===seat.key ? '2px solid #111' : isMultiSelected(row, seat) ? '2px solid #3b82f6' : 'none',
+                    outlineOffset: '1px',
                   }"
+                  style="pointer-events:auto"
                   @pointerdown.stop
-                  @click.stop="onSeatClick(row, seat, $event)"
-                >{{ (row.seatSize || 22) >= 14 ? seat.label : '' }}</div>
+                  @click.stop="seat.status !== 'deleted' && onSeatClick(row, seat, $event)"
+                >{{ (row.seatSize || 22) >= 14 && seat.status !== 'deleted' ? seat.label : '' }}</div>
               </div>
             </div>
 
@@ -1194,8 +1813,26 @@ async function saveAll() {
     </div>
 
     <!-- Panneau latéral de configuration -->
-    <div class="w-56 lg:w-72 shrink-0 bg-white rounded-2xl shadow-sm p-4 overflow-y-auto text-sm">
-      <h3 class="font-bold text-gray-800 mb-3">Propriétés</h3>
+    <!-- Mobile: overlay absolu depuis le haut -->
+    <!-- Desktop: colonne à droite -->
+    <div
+      class="bg-white rounded-2xl shadow-sm p-4 overflow-y-auto text-sm transition-all"
+      :class="[
+        'lg:relative lg:w-72 lg:shrink-0 lg:flex lg:flex-col',
+        showProps
+          ? 'absolute inset-y-0 right-0 z-20 w-64 shadow-xl lg:shadow-sm'
+          : 'hidden lg:flex'
+      ]"
+    >
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="font-bold text-gray-800">Propriétés</h3>
+        <button @click="showProps = false"
+          class="lg:hidden w-7 h-7 flex items-center justify-center rounded-lg bg-gray-100 hover:bg-gray-200 text-gray-500">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/>
+          </svg>
+        </button>
+      </div>
 
       <div v-if="!selected && multiSelected.size === 0" class="text-sm text-gray-400 py-6 text-center">
         Sélectionnez un élément du plan.
@@ -1269,17 +1906,22 @@ async function saveAll() {
           </select>
         </div>
         <div>
-          <label class="text-xs font-semibold text-gray-500">Couleur</label>
+          <label class="text-xs font-semibold text-gray-500">Taille icône (px)</label>
+          <input v-model="selectedFreeZone.iconSize" @input="scheduleSave" type="number" min="10" max="120" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500">Couleur de fond</label>
           <div class="flex items-center gap-2 mt-1">
             <input v-model="selectedFreeZone.color" @input="scheduleSave" type="color" class="w-10 h-9 rounded border border-gray-200 cursor-pointer" />
             <input v-model="selectedFreeZone.color" @input="scheduleSave" type="text" class="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
         </div>
         <div>
-          <label class="text-xs font-semibold text-gray-500">Motif de fond</label>
-          <select v-model="selectedFreeZone.pattern" @change="scheduleSave" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm">
-            <option v-for="p in FREE_ZONE_PATTERNS" :key="p.id" :value="p.id">{{ p.label }}</option>
-          </select>
+          <label class="text-xs font-semibold text-gray-500">Couleur du texte</label>
+          <div class="flex items-center gap-2 mt-1">
+            <input :value="selectedFreeZone.textColor || '#000000'" @input="selectedFreeZone.textColor = $event.target.value; scheduleSave()" type="color" class="w-10 h-9 rounded border border-gray-200 cursor-pointer" />
+            <input :value="selectedFreeZone.textColor || '#000000'" @input="selectedFreeZone.textColor = $event.target.value; scheduleSave()" type="text" class="flex-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+          </div>
         </div>
         <div class="grid grid-cols-2 gap-3">
           <div>
@@ -1296,8 +1938,59 @@ async function saveAll() {
           <input v-model="selectedFreeZone.labelFontSize" @input="scheduleSave" type="number" min="6" max="24" class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
         </div>
         <p class="text-[11px] text-gray-300">Zone non liée à une catégorie (scène, porte, sanitaires, zone inaccessible…). Tirez un bord pour redimensionner.</p>
-        <button @click="removeSelected" class="w-full mt-2 py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
-          Supprimer cette zone libre
+        <div class="flex gap-2 mt-2">
+          <button @click="resetFreeZone" class="flex-1 py-2 rounded-lg bg-gray-100 text-gray-600 text-sm font-semibold hover:bg-gray-200">
+            Réinitialiser
+          </button>
+          <button @click="removeSelected" class="flex-1 py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
+            Supprimer
+          </button>
+        </div>
+      </div>
+
+      <!-- Propriétés d'une table individuelle dans une section -->
+      <div v-else-if="selectedTableSectionTable" class="flex flex-col gap-3">
+        <div>
+          <p class="text-xs font-bold text-gray-700">
+            Table T{{ selectedTableSectionTable.tableIndex + 1 }}
+            <span class="font-normal text-gray-400 ml-1">dans {{ selectedTableSectionTable.ts.section || selectedTableSectionTable.ts.label }}</span>
+          </p>
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500">Nombre de sièges</label>
+          <input
+            :value="(selectedTableSectionTable.ts.tableSeatsOverrides?.[selectedTableSectionTable.tableIndex] !== undefined)
+              ? selectedTableSectionTable.ts.tableSeatsOverrides[selectedTableSectionTable.tableIndex]
+              : (selectedTableSectionTable.ts.seatsPerTable || 6)"
+            @input="updateTableSeatsCount($event.target.value)"
+            type="number" min="1" max="20"
+            class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm"
+          />
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500">Rotation (°)</label>
+          <div class="flex items-center gap-2 mt-1">
+            <input
+              :value="selectedTableSectionTable.ts.tableRotationOverrides?.[selectedTableSectionTable.tableIndex] || 0"
+              @input="updateTableRotation($event.target.value)"
+              type="range" min="0" max="359" step="1"
+              class="flex-1 accent-indigo-500" />
+            <input
+              :value="selectedTableSectionTable.ts.tableRotationOverrides?.[selectedTableSectionTable.tableIndex] || 0"
+              @input="updateTableRotation($event.target.value)"
+              type="number" min="0" max="359"
+              class="w-16 px-2 py-2 border border-gray-200 rounded-lg text-sm text-center" />
+          </div>
+        </div>
+        <div class="flex flex-col gap-2 mt-1">
+          <button @click="deleteEntireTable"
+            class="w-full py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
+            Supprimer la table
+          </button>
+        </div>
+        <button @click="selectTableSection(selectedTableSectionTable.ts)"
+          class="text-xs text-indigo-500 hover:underline text-left">
+          ← Retour à la section
         </button>
       </div>
 
@@ -1308,6 +2001,22 @@ async function saveAll() {
           <input v-model="selectedTableSection.section" @input="scheduleSave" placeholder="ex. VIP-TABLES"
             class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:border-gray-400" />
           <p class="text-[10px] text-gray-400 mt-0.5">Préfixe des sièges (section-table-siège, ex. VIP-1-1)</p>
+        </div>
+        <div class="flex items-center justify-between">
+          <label class="text-xs font-semibold text-gray-500">Afficher section</label>
+          <button
+            @click="selectedTableSection.badgeVisible = !selectedTableSection.badgeVisible; scheduleSave()"
+            class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+            :class="selectedTableSection.badgeVisible ? 'bg-indigo-500' : 'bg-gray-200'"
+          >
+            <span class="inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform duration-200"
+              :class="selectedTableSection.badgeVisible ? 'translate-x-4' : 'translate-x-0'" />
+          </button>
+        </div>
+        <div v-if="selectedTableSection.badgeVisible">
+          <label class="text-xs font-semibold text-gray-500">Taille badge (px)</label>
+          <input v-model="selectedTableSection.rowLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
+            class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
         </div>
         <div>
           <label class="text-xs font-semibold text-gray-500">Catégorie</label>
@@ -1333,8 +2042,8 @@ async function saveAll() {
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
           <div>
-            <label class="text-xs font-semibold text-gray-500">Taille siège (px)</label>
-            <input v-model="selectedTableSection.seatSize" @input="scheduleSave" type="number" min="10" max="50"
+            <label class="text-xs font-semibold text-gray-500">Taille nom table (px)</label>
+            <input v-model="selectedTableSection.tableLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
           <div>
@@ -1343,9 +2052,18 @@ async function saveAll() {
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
           <div>
-            <label class="text-xs font-semibold text-gray-500">Taille badge (px)</label>
-            <input v-model="selectedTableSection.rowLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
+            <label class="text-xs font-semibold text-gray-500">Taille n° siège (px)</label>
+            <input v-model="selectedTableSection.seatLabelFontSize" @input="scheduleSave" type="number" min="0" max="24"
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+          </div>
+        </div>
+        <div>
+          <label class="text-xs font-semibold text-gray-500">Rotation (°)</label>
+          <div class="flex items-center gap-2 mt-1">
+            <input v-model="selectedTableSection.rotation" @input="scheduleSave" type="range" min="0" max="359" step="1"
+              class="flex-1 accent-indigo-500" />
+            <input v-model="selectedTableSection.rotation" @input="scheduleSave" type="number" min="0" max="359"
+              class="w-16 px-2 py-2 border border-gray-200 rounded-lg text-sm text-center" />
           </div>
         </div>
         <p class="text-xs text-gray-400">{{ (selectedTableSection.tableCount || 3) * (selectedTableSection.seatsPerTable || 6) }} sièges au total</p>
@@ -1386,10 +2104,26 @@ async function saveAll() {
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
         </div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <label class="text-xs font-semibold text-gray-500">Taille nom table (px)</label>
+            <input v-model="selectedTableZone.tableLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
+              class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+          </div>
+          <div>
+            <label class="text-xs font-semibold text-gray-500">Taille n° siège (px)</label>
+            <input v-model="selectedTableZone.seatLabelFontSize" @input="scheduleSave" type="number" min="0" max="24"
+              class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+          </div>
+        </div>
         <div>
-          <label class="text-xs font-semibold text-gray-500">Taille du badge (px)</label>
-          <input v-model="selectedTableZone.rowLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
-            class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
+          <label class="text-xs font-semibold text-gray-500">Rotation (°)</label>
+          <div class="flex items-center gap-2 mt-1">
+            <input v-model="selectedTableZone.rotation" @input="scheduleSave" type="range" min="0" max="359" step="1"
+              class="flex-1 accent-indigo-500" />
+            <input v-model="selectedTableZone.rotation" @input="scheduleSave" type="number" min="0" max="359"
+              class="w-16 px-2 py-2 border border-gray-200 rounded-lg text-sm text-center" />
+          </div>
         </div>
         <button @click="removeSelected" class="w-full mt-2 py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
           Supprimer cette table
@@ -1403,6 +2137,22 @@ async function saveAll() {
           <input v-model="selectedSeatRow.section" @input="scheduleSave" placeholder="ex. TRIBUNE-NORD"
             class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm focus:outline-none focus:border-gray-400" />
           <p class="text-[10px] text-gray-400 mt-0.5">Identifiant unique — préfixe des clés de sièges (section-rangée-siège)</p>
+        </div>
+        <div class="flex items-center justify-between">
+          <label class="text-xs font-semibold text-gray-500">Afficher section</label>
+          <button
+            @click="selectedSeatRow.badgeVisible = !selectedSeatRow.badgeVisible; scheduleSave()"
+            class="relative inline-flex h-5 w-9 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200"
+            :class="selectedSeatRow.badgeVisible ? 'bg-indigo-500' : 'bg-gray-200'"
+          >
+            <span class="inline-block h-4 w-4 rounded-full bg-white shadow transform transition-transform duration-200"
+              :class="selectedSeatRow.badgeVisible ? 'translate-x-4' : 'translate-x-0'" />
+          </button>
+        </div>
+        <div v-if="selectedSeatRow.badgeVisible">
+          <label class="text-xs font-semibold text-gray-500">Taille du badge (px)</label>
+          <input v-model="selectedSeatRow.rowLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
+            class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
         </div>
         <div>
           <label class="text-xs font-semibold text-gray-500">Catégorie</label>
@@ -1435,12 +2185,6 @@ async function saveAll() {
             <input v-model="selectedSeatRow.seatSize" @input="scheduleSave" type="number" min="10" max="40"
               class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
           </div>
-        </div>
-
-        <div>
-          <label class="text-xs font-semibold text-gray-500">Taille du badge (px)</label>
-          <input v-model="selectedSeatRow.rowLabelFontSize" @input="scheduleSave" type="number" min="6" max="24"
-            class="w-full mt-1 px-3 py-2 border border-gray-200 rounded-lg text-sm" />
         </div>
 
         <div class="border-t border-gray-100 pt-3">
@@ -1498,18 +2242,6 @@ async function saveAll() {
           <div class="flex justify-between"><dt class="text-gray-400">Rangée</dt><dd class="font-medium text-gray-700">{{ selectedSeat.rowLabel }}</dd></div>
           <div class="flex justify-between"><dt class="text-gray-400">Colonne</dt><dd class="font-medium text-gray-700">{{ selectedSeat.colLabel }}</dd></div>
           <div class="flex justify-between"><dt class="text-gray-400">Catégorie</dt><dd class="font-medium text-gray-700">{{ catById(selectedSeat.categoryId).name }}</dd></div>
-          <div class="flex justify-between items-center"><dt class="text-gray-400">Statut</dt>
-            <dd>
-              <span class="px-2 py-0.5 rounded-full text-xs font-semibold"
-                :class="{
-                  'bg-gray-200 text-gray-600': selectedSeat.status === 'sold',
-                  'bg-amber-50 text-amber-600': selectedSeat.status === 'disabled',
-                  'bg-green-50 text-green-600': selectedSeat.status === 'available',
-                }">
-                {{ selectedSeat.status === 'sold' ? 'Vendu' : selectedSeat.status === 'disabled' ? 'Désactivé' : 'Disponible' }}
-              </span>
-            </dd>
-          </div>
         </dl>
         <div>
           <label class="text-xs font-semibold text-gray-500">Changer la catégorie de ce siège</label>
@@ -1526,15 +2258,9 @@ async function saveAll() {
             <option v-for="c in categories" :key="c.id" :value="c.id">{{ c.name }}</option>
           </select>
         </div>
-        <button v-if="selectedSeat.status !== 'disabled'" @click="toggleSelectedSeatStatus" class="w-full mt-1 py-2 rounded-lg bg-gray-100 text-gray-700 text-sm font-semibold hover:bg-gray-200">
-          Marquer {{ selectedSeat.status === 'sold' ? 'disponible' : 'vendu' }}
+        <button @click="deleteSeat" class="w-full py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
+          Supprimer ce siège
         </button>
-        <button @click="toggleSelectedSeatDisabled"
-          class="w-full py-2 rounded-lg text-sm font-semibold"
-          :class="selectedSeat.status === 'disabled' ? 'bg-green-50 text-green-600 hover:bg-green-100' : 'bg-amber-50 text-amber-600 hover:bg-amber-100'">
-          {{ selectedSeat.status === 'disabled' ? 'Réactiver ce siège' : 'Désactiver ce siège (non sélectionnable)' }}
-        </button>
-        <p class="text-[11px] text-gray-300">Le statut "vendu" reste une démonstration locale. La catégorie et le statut désactivé sont persistés.</p>
       </div>
 
       <!-- Propriétés d'un siège de section de tables -->
@@ -1546,17 +2272,9 @@ async function saveAll() {
         <dl class="text-sm flex flex-col gap-1.5">
           <div class="flex justify-between"><dt class="text-gray-400">Section</dt><dd class="font-medium text-gray-700">{{ selectedTableSectionSeat.ts.section || selectedTableSectionSeat.ts.label }}</dd></div>
           <div class="flex justify-between"><dt class="text-gray-400">Catégorie</dt><dd class="font-medium text-gray-700">{{ catById(selectedTableSectionSeat.ts.categoryId).name }}</dd></div>
-          <div class="flex justify-between items-center"><dt class="text-gray-400">Statut</dt>
-            <dd><span class="px-2 py-0.5 rounded-full text-xs font-semibold"
-              :class="selectedTableSectionSeat.status === 'disabled' ? 'bg-amber-50 text-amber-600' : 'bg-green-50 text-green-600'">
-              {{ selectedTableSectionSeat.status === 'disabled' ? 'Désactivé' : 'Disponible' }}
-            </span></dd>
-          </div>
         </dl>
-        <button @click="toggleSelectedTableSectionSeatDisabled"
-          class="w-full py-2 rounded-lg text-sm font-semibold"
-          :class="selectedTableSectionSeat.status === 'disabled' ? 'bg-green-50 text-green-600 hover:bg-green-100' : 'bg-amber-50 text-amber-600 hover:bg-amber-100'">
-          {{ selectedTableSectionSeat.status === 'disabled' ? 'Réactiver ce siège' : 'Désactiver ce siège' }}
+        <button @click="deleteTableSectionSeat" class="w-full py-2 rounded-lg bg-red-50 text-red-500 text-sm font-semibold hover:bg-red-100">
+          Supprimer ce siège
         </button>
       </div>
 
@@ -1569,23 +2287,7 @@ async function saveAll() {
         <dl class="text-sm flex flex-col gap-1.5">
           <div class="flex justify-between"><dt class="text-gray-400">Section</dt><dd class="font-medium text-gray-700">{{ selectedTableSeat.table.section || selectedTableSeat.table.label }}</dd></div>
           <div class="flex justify-between"><dt class="text-gray-400">Catégorie</dt><dd class="font-medium text-gray-700">{{ catById(selectedTableSeat.table.categoryId).name }}</dd></div>
-          <div class="flex justify-between items-center"><dt class="text-gray-400">Statut</dt>
-            <dd>
-              <span class="px-2 py-0.5 rounded-full text-xs font-semibold"
-                :class="{
-                  'bg-amber-50 text-amber-600': selectedTableSeat.status === 'disabled',
-                  'bg-green-50 text-green-600': selectedTableSeat.status !== 'disabled',
-                }">
-                {{ selectedTableSeat.status === 'disabled' ? 'Désactivé' : 'Disponible' }}
-              </span>
-            </dd>
-          </div>
         </dl>
-        <button @click="toggleSelectedTableSeatDisabled"
-          class="w-full py-2 rounded-lg text-sm font-semibold"
-          :class="selectedTableSeat.status === 'disabled' ? 'bg-green-50 text-green-600 hover:bg-green-100' : 'bg-amber-50 text-amber-600 hover:bg-amber-100'">
-          {{ selectedTableSeat.status === 'disabled' ? 'Réactiver ce siège' : 'Désactiver ce siège' }}
-        </button>
       </div>
     </div>
   </div>
@@ -1594,8 +2296,8 @@ async function saveAll() {
 <style scoped>
 .editor-seat-card {
   border: 1px solid transparent;
-  border-radius: 22px;
-  padding: 14px;
+  border-radius: 8px;
+  padding: 6px;
 }
 .editor-row-badge {
   position: relative;
@@ -1611,4 +2313,28 @@ async function saveAll() {
   transform: translateX(-50%);
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
 }
+.lod-blur {
+  filter: blur(2px);
+  opacity: 0.5;
+  transition: filter 0.2s, opacity 0.2s;
+  pointer-events: none;
+}
+.lod-section-badge {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #fff;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 2px 12px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.1);
+  z-index: 3;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.toast-enter-active, .toast-leave-active { transition: opacity 0.2s, transform 0.2s; }
+.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(8px); }
 </style>
