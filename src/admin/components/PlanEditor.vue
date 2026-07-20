@@ -9,6 +9,7 @@ const props = defineProps({
   venueId: { type: String, required: true },
   planStatus: { type: String, default: 'draft' },
   planPendingChanges: { type: Boolean, default: false },
+  planName: { type: String, default: '' },
 });
 const emit = defineEmits(['changed']);
 
@@ -1222,6 +1223,18 @@ function clearMultiSelection() {
 const saving = ref(false);
 const saveError = ref('');
 const saveSuccess = ref(false);
+// ---------- Nom modifiable ----------
+const localName = ref(props.planName);
+const savingName = ref(false);
+watch(() => props.planName, (v) => { localName.value = v; });
+async function saveName() {
+  const n = localName.value.trim();
+  if (!n || n === props.planName) return;
+  savingName.value = true;
+  try { await adminApi.updateVenue(props.venueId, { name: n }); emit('changed'); } catch (_) {}
+  savingName.value = false;
+}
+
 const _isDirtyFlag = ref(props.planPendingChanges);
 const isDirty = computed({
   get: () => _isDirtyFlag.value || pendingCatDeletions.size > 0,
@@ -1286,6 +1299,14 @@ async function saveAll() {
             Modif. non sauvegardées
           </span>
         </div>
+        <!-- Nom du plan -->
+        <input
+          v-model="localName"
+          class="min-w-0 flex-1 text-sm font-semibold text-gray-800 bg-transparent border-b border-transparent hover:border-gray-300 focus:border-indigo-400 focus:outline-none px-1 py-0.5 transition truncate"
+          :title="localName"
+          @blur="saveName"
+          @keydown.enter.prevent="$event.target.blur()"
+        />
         <!-- Catégories -->
         <div class="shrink-0">
           <button ref="catBtnRef" @click="toggleCatPanel"
