@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { adminApi } from '../services/adminApi.js';
+import { auth } from '../services/auth.js';
 import { computeAxisLabel } from '../../services/seatLabel.js';
 import EventPlanView from '../components/EventPlanView.vue';
 
@@ -36,35 +37,57 @@ async function load() {
   } finally { loading.value = false; }
 }
 
-let mercureSource = null;
-function connectMercure() {
+let sseAbort = null;
+function applySSEChanges(changes) {
+  const updated = { ...eventDetail.value };
+  const seats = [...(updated.seats || [])];
+  for (const change of changes) {
+    const existing = seats.find(s => s.seatKey === change.seatKey);
+    if (existing) { existing.status = change.status; }
+    else { seats.push({ seatKey: change.seatKey, status: change.status }); }
+  }
+  updated.seats = seats;
+  eventDetail.value = updated;
+}
+
+async function connectSSE() {
+  const token = auth.getToken();
+  if (!token) return;
+  sseAbort = new AbortController();
   try {
-    const url = new URL(`${window.location.origin}/.well-known/mercure`);
-    url.searchParams.append('topic', `event/${eventId.value}/seats`);
-    mercureSource = new EventSource(url.toString());
-    mercureSource.onerror = () => { mercureSource?.close(); mercureSource = null; };
-    mercureSource.onmessage = (e) => {
-      const data = JSON.parse(e.data);
-      const updated = { ...eventDetail.value };
-      const seats = [...(updated.seats || [])];
-      for (const key of data.seatKeys) {
-        const existing = seats.find(s => s.seatKey === key);
-        if (existing) { existing.status = data.status; }
-        else { seats.push({ seatKey: key, status: data.status }); }
+    const res = await fetch(`/api/admin/events/${eventId.value}/stream`, {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: sseAbort.signal,
+    });
+    if (!res.ok || !res.body) return;
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let eventType = '';
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith('event:')) { eventType = line.slice(6).trim(); }
+        else if (line.startsWith('data:') && eventType === 'update') {
+          try { applySSEChanges(JSON.parse(line.slice(5).trim())); } catch (_) {}
+          eventType = '';
+        } else if (line === '') { eventType = ''; }
       }
-      updated.seats = seats;
-      eventDetail.value = updated;
-    };
+    }
   } catch (_) {}
 }
 
 onMounted(async () => {
   await load();
-  connectMercure();
+  connectSSE();
 });
 
 onUnmounted(() => {
-  mercureSource?.close();
+  sseAbort?.abort();
 });
 
 const seatStatusMap = computed(() => {
