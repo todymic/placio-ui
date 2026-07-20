@@ -38,25 +38,24 @@ async function load() {
 
 let mercureSource = null;
 function connectMercure() {
-  const url = new URL('http://localhost:3000/.well-known/mercure');
-  url.searchParams.append('topic', `event/${eventId.value}/seats`);
-  mercureSource = new EventSource(url.toString());
-  mercureSource.onmessage = (e) => {
-    const data = JSON.parse(e.data);
-    // Mise à jour locale sans reload réseau
-    const updated = { ...eventDetail.value };
-    const seats = [...(updated.seats || [])];
-    for (const key of data.seatKeys) {
-      const existing = seats.find(s => s.seatKey === key);
-      if (existing) {
-        existing.status = data.status;
-      } else {
-        seats.push({ seatKey: key, status: data.status });
+  try {
+    const url = new URL(`${window.location.origin}/.well-known/mercure`);
+    url.searchParams.append('topic', `event/${eventId.value}/seats`);
+    mercureSource = new EventSource(url.toString());
+    mercureSource.onerror = () => { mercureSource?.close(); mercureSource = null; };
+    mercureSource.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      const updated = { ...eventDetail.value };
+      const seats = [...(updated.seats || [])];
+      for (const key of data.seatKeys) {
+        const existing = seats.find(s => s.seatKey === key);
+        if (existing) { existing.status = data.status; }
+        else { seats.push({ seatKey: key, status: data.status }); }
       }
-    }
-    updated.seats = seats;
-    eventDetail.value = updated;
-  };
+      updated.seats = seats;
+      eventDetail.value = updated;
+    };
+  } catch (_) {}
 }
 
 onMounted(async () => {
