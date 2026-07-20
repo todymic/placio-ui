@@ -12,6 +12,17 @@ export default defineConfig({
       cert: './certs/localhost.pem',
     },
     proxy: {
+      '/api/admin/events': {
+        target: 'https://localhost:8000',
+        changeOrigin: true,
+        secure: false,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes) => {
+            proxyRes.headers['cache-control'] = 'no-cache';
+            proxyRes.headers['x-accel-buffering'] = 'no';
+          });
+        },
+      },
       '/api': {
         target: 'https://localhost:8000',
         changeOrigin: true,
@@ -20,7 +31,15 @@ export default defineConfig({
       '/.well-known/mercure': {
         target: 'http://127.0.0.1:3000',
         changeOrigin: true,
-        ws: true,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes, req, res) => {
+            // Désactiver tout buffering pour SSE
+            res.setHeader('X-Accel-Buffering', 'no');
+            res.setHeader('Cache-Control', 'no-cache');
+            proxyRes.headers['x-accel-buffering'] = 'no';
+            proxyRes.headers['cache-control'] = 'no-cache';
+          });
+        },
       },
     },
   },
