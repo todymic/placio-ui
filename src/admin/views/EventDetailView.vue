@@ -39,7 +39,11 @@ async function load() {
 
 let mercureSource = null;
 
-function applyChanges(changes) {
+function applyChanges(data) {
+  // Normalise les deux formats : [{seatKey,status}] ou {seatKeys:[],status:''}
+  const changes = Array.isArray(data)
+    ? data
+    : (data.seatKeys || []).map(k => ({ seatKey: k, status: data.status }));
   const updated = { ...eventDetail.value };
   const seats = [...(updated.seats || [])];
   for (const change of changes) {
