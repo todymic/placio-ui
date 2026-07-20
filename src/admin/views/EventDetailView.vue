@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { adminApi } from '../services/adminApi.js';
-import { auth } from '../services/auth.js';
+
 import { computeAxisLabel } from '../../services/seatLabel.js';
 import EventPlanView from '../components/EventPlanView.vue';
 
@@ -37,8 +37,9 @@ async function load() {
   } finally { loading.value = false; }
 }
 
-let sseAbort = null;
-function applySSEChanges(changes) {
+let mercureSource = null;
+
+function applyChanges(changes) {
   const updated = { ...eventDetail.value };
   const seats = [...(updated.seats || [])];
   for (const change of changes) {
@@ -50,35 +51,18 @@ function applySSEChanges(changes) {
   eventDetail.value = updated;
 }
 
-async function connectSSE() {
-  const token = auth.getToken();
-  if (!token) return;
-  sseAbort = new AbortController();
-  try {
-    const res = await fetch(`/api/admin/events/${eventId.value}/stream`, {
-      headers: { Authorization: `Bearer ${token}` },
-      signal: sseAbort.signal,
-    });
-    if (!res.ok || !res.body) return;
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let eventType = '';
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop();
-      for (const line of lines) {
-        if (line.startsWith('event:')) { eventType = line.slice(6).trim(); }
-        else if (line.startsWith('data:') && eventType === 'update') {
-          try { applySSEChanges(JSON.parse(line.slice(5).trim())); } catch (_) {}
-          eventType = '';
-        } else if (line === '') { eventType = ''; }
-      }
-    }
-  } catch (_) {}
+function connectSSE() {
+  const url = new URL('/.well-known/mercure', window.location.origin);
+  url.searchParams.append('topic', `event/${eventId.value}/seats`);
+  mercureSource = new EventSource(url.toString());
+  mercureSource.onmessage = (e) => {
+    try { applyChanges(JSON.parse(e.data)); } catch (_) {}
+  };
+  mercureSource.onerror = () => {
+    mercureSource?.close();
+    mercureSource = null;
+    setTimeout(connectSSE, 3000);
+  };
 }
 
 onMounted(async () => {
@@ -87,7 +71,7 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
-  sseAbort?.abort();
+  mercureSource?.close();
 });
 
 const seatStatusMap = computed(() => {
