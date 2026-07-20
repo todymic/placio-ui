@@ -38,6 +38,16 @@ async function load() {
 }
 
 let mercureSource = null;
+let pollInterval = null;
+
+async function pollSeats() {
+  try {
+    const data = await adminApi.getEventSeats(eventId.value);
+    const indexed = data.seats || {};
+    const seats = Object.entries(indexed).map(([seatKey, s]) => ({ seatKey, status: s.status }));
+    eventDetail.value = { ...eventDetail.value, seats };
+  } catch (_) {}
+}
 
 function applyChanges(data) {
   // Normalise les deux formats : [{seatKey,status}] ou {seatKeys:[],status:''}
@@ -72,10 +82,12 @@ function connectSSE() {
 onMounted(async () => {
   await load();
   connectSSE();
+  pollInterval = setInterval(pollSeats, 2000);
 });
 
 onUnmounted(() => {
   mercureSource?.close();
+  clearInterval(pollInterval);
 });
 
 const seatStatusMap = computed(() => {

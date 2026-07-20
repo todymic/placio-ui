@@ -266,6 +266,9 @@ export const adminApi = {
     await apiFetch(`/api/events/${id}`, { method: 'DELETE' });
     return { success: true };
   },
+  async getEventSeats(eventId) {
+    return (await apiFetch(`/api/events/${eventId}/seats`)).json();
+  },
   async bulkUpdateEventSeats(eventId, seatKeys, status) {
     return (await apiFetch(`/api/events/${eventId}/seats/bulk-status`, {
       method: 'PATCH',
