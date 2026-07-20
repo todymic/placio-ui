@@ -60,7 +60,13 @@ function connectSSE() {
   url.searchParams.append('topic', `event/${eventId.value}/seats`);
   mercureSource = new EventSource(url.toString());
   mercureSource.onmessage = (e) => {
-    try { applyChanges(JSON.parse(e.data)); } catch (_) {}
+    try {
+      const data = JSON.parse(e.data);
+      applyChanges(data);
+      if (window.parent !== window) {
+        window.parent.postMessage({ type: 'placio:seat-update', payload: data }, '*');
+      }
+    } catch (_) {}
   };
   mercureSource.onerror = () => {
     mercureSource?.close();
