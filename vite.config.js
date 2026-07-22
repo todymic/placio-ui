@@ -29,7 +29,7 @@ export default defineConfig({
         secure: false,
       },
       '/.well-known/mercure': {
-        target: 'http://127.0.0.1:3000',
+        target: 'http://127.0.0.1:3010',
         changeOrigin: true,
         configure: (proxy) => {
           proxy.on('proxyRes', (proxyRes, req, res) => {
